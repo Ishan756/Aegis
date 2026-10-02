@@ -1,0 +1,102 @@
+# Aegis — local development stack.
+#
+#   docker compose up --build
+#
+# Postgres and Redis are behind the `infra` profile and do NOT start by default:
+#   docker compose --profile infra up --build
+#
+# NOTE: authored but not executed during development (Docker unavailable).
+
+name: aegis
+
+services:
+  backend:
+    build:
+      context: ./backend
+    image: aegis-backend:dev
+    # `required: false` lets the stack boot before a .env exists.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      AEGIS_ENVIRONMENT: local
+      AEGIS_DEBUG: "true"
+      AEGIS_LOG_FORMAT: console
+    ports:
+      - "8000:8000"
+    volumes:
+      # Live-reload against the host source tree.
+      - ./backend/app:/app/app:ro
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --reload
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Read at build time; see frontend/Dockerfile.
+        VITE_API_BASE_URL: /api/v1
+    image: aegis-frontend:dev
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------- Optional: not started without `--profile infra` ----------
+
+  postgres:
+    profiles: ["infra"]
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aegis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aegis}
+      POSTGRES_DB: ${POSTGRES_DB:-aegis}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aegis}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    profiles: ["infra"]
+    image: redis:8-alpine
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:

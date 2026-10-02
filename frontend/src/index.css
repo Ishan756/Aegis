@@ -1,0 +1,333 @@
+/* Aegis dashboard — dark operations console */
+
+:root {
+  --bg: #0a0e14;
+  --bg-raised: #111823;
+  --bg-inset: #0d131c;
+  --border: #1f2a3a;
+  --border-strong: #2b3a4f;
+  --text: #e6edf6;
+  --text-muted: #8b9bb1;
+  --text-faint: #5d6d82;
+
+  --ok: #35c07f;
+  --warn: #e0a33a;
+  --muted: #6b7c93;
+  --error: #e5574f;
+  --accent: #4c8dff;
+
+  --radius: 12px;
+  --radius-sm: 7px;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(1200px 600px at 15% -10%, #16202e 0%, transparent 60%),
+    var(--bg);
+  color: var(--text);
+  font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+.metric__mono,
+.masthead__stage,
+.badge {
+  font-family: 'JetBrains Mono', 'SF Mono', ui-monospace, 'Cascadia Code', monospace;
+}
+
+/* ---------- Layout ---------- */
+
+.app {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 40px 24px 64px;
+}
+
+.masthead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding-bottom: 24px;
+  margin-bottom: 28px;
+  border-bottom: 1px solid var(--border);
+}
+
+.masthead__brand {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.masthead__mark {
+  width: 42px;
+  height: 42px;
+  flex-shrink: 0;
+  border-radius: 11px;
+  background: linear-gradient(140deg, var(--accent), #7b5cff 70%);
+  box-shadow: 0 0 0 1px #ffffff1a, 0 8px 22px -10px var(--accent);
+  position: relative;
+}
+
+/* Shield glyph, drawn in CSS so the logo needs no asset. */
+.masthead__mark::after {
+  content: '';
+  position: absolute;
+  inset: 11px;
+  clip-path: polygon(50% 0, 100% 22%, 100% 62%, 50% 100%, 0 62%, 0 22%);
+  background: #fff;
+  opacity: 0.94;
+}
+
+.masthead__title {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+.masthead__tagline {
+  margin: 3px 0 0;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.masthead__stage {
+  padding: 6px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--bg-inset);
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 18px;
+}
+
+.grid__full {
+  grid-column: 1 / -1;
+}
+
+/* ---------- Card ---------- */
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, var(--bg-raised), var(--bg-inset));
+  box-shadow: 0 1px 0 #ffffff08 inset;
+}
+
+.card--ok {
+  border-color: #1d4b36;
+}
+.card--warn {
+  border-color: #4b3d1d;
+}
+.card--error {
+  border-color: #4b2626;
+}
+
+.card__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.card__title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.card__subtitle {
+  margin: 3px 0 0;
+  color: var(--text-faint);
+  font-size: 13px;
+}
+
+.card__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+/* ---------- Badges ---------- */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 11.5px;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.badge__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.badge--ok {
+  color: var(--ok);
+  background: #35c07f14;
+}
+.badge--warn {
+  color: var(--warn);
+  background: #e0a33a14;
+}
+.badge--muted {
+  color: var(--muted);
+  background: #6b7c9314;
+}
+.badge--error {
+  color: var(--error);
+  background: #e5574f14;
+}
+
+/* ---------- Metrics ---------- */
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 14px 18px;
+  margin: 0;
+}
+
+.metric dt {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+
+.metric dd {
+  margin: 3px 0 0;
+  font-size: 14.5px;
+  word-break: break-word;
+}
+
+.note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.note--error {
+  color: var(--error);
+}
+
+/* ---------- Table ---------- */
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+}
+
+.table th,
+.table td {
+  padding: 9px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.table thead th {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+
+.table tbody tr:last-child th,
+.table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.table tbody th {
+  font-weight: 500;
+}
+
+.table__detail {
+  color: var(--text-muted);
+}
+
+/* ---------- Button ---------- */
+
+.button {
+  padding: 6px 13px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-inset);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.button:hover {
+  border-color: var(--accent);
+  background: #4c8dff14;
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---------- Footer ---------- */
+
+.footer {
+  margin-top: 32px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 12.5px;
+}
+
+.footer p {
+  margin: 0;
+}
+
+@media (max-width: 560px) {
+  .app {
+    padding: 28px 16px 48px;
+  }
+
+  .masthead__title {
+    font-size: 25px;
+  }
+}
