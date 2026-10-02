@@ -34,8 +34,8 @@ class StatusService:
         of failing, so the dashboard can show honest progress.
         """
 
-        def configured(name: str, url: str | None) -> ComponentHealth:
-            if url:
+        def configured(name: str, is_configured: bool) -> ComponentHealth:
+            if is_configured:
                 return ComponentHealth(name=name, status="ok", detail="Configured")
             return ComponentHealth(name=name, status="not_configured", detail="Not required yet")
 
@@ -44,11 +44,9 @@ class StatusService:
             ComponentHealth(
                 name="graph", status="not_configured", detail="LangGraph workflow pending"
             ),
-            ComponentHealth(
-                name="mcp", status="not_configured", detail="No MCP servers registered"
-            ),
-            configured("database", self._settings.database_url),
-            configured("cache", self._settings.redis_url),
+            configured("mcp", self._settings.mcp.is_configured),
+            configured("database", self._settings.database.is_configured),
+            configured("cache", self._settings.redis.is_configured),
         ]
 
     def health(self) -> HealthResponse:

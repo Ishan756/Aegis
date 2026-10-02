@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from app.core.config import Settings
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ENV_EXAMPLE = REPO_ROOT / ".env.example"
 
 
 def test_defaults_are_local_development() -> None:
@@ -22,5 +27,39 @@ def test_cors_origins_accept_comma_separated_string() -> None:
 def test_optional_dependencies_default_to_unset() -> None:
     settings = Settings(_env_file=None)
 
-    assert settings.database_url is None
-    assert settings.redis_url is None
+    assert settings.database.url is None
+    assert settings.redis.url is None
+    assert settings.database.is_configured is False
+    assert settings.redis.is_configured is False
+
+
+def test_comma_separated_origins_load_from_env_file(tmp_path: Path) -> None:
+    """A comma-separated list must survive the trip through a .env file.
+
+    pydantic-settings JSON-decodes list fields by default, which turns this
+    into a startup crash unless the field opts out with NoDecode.
+    """
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "AEGIS_ENVIRONMENT=dev\nAEGIS_CORS_ORIGINS=http://a.test, http://b.test\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=env_file)
+
+    assert settings.environment == "dev"
+    assert settings.cors_origins == ["http://a.test", "http://b.test"]
+
+
+def test_shipped_env_example_is_valid() -> None:
+    """The template users copy must load without error.
+
+    Guards against documenting configuration the app cannot actually parse.
+    """
+    assert ENV_EXAMPLE.is_file(), "missing .env.example at repo root"
+
+    settings = Settings(_env_file=ENV_EXAMPLE)
+
+    assert settings.environment in {"local", "dev", "staging", "prod"}
+    assert settings.api_prefix.startswith("/")
+    assert settings.cors_origins, "at least one origin must be configured"
