@@ -6,11 +6,12 @@ Aegis is an agent that analyses a software repository, produces a deployment
 plan, deploys it through audited MCP tools, verifies the result, and investigates
 failures — escalating to a human before it does anything destructive.
 
-> **Status: Stage 4 of 18 — first working agent.**
-> A LangGraph planning agent is live: it turns a natural-language DevOps request
-> into a structured execution plan via `POST /api/agent/plan`. Plans name the
-> tools they would use but nothing is executed yet. No MCP server, no GitHub or
-> cloud calls, and no credentials are required.
+> **Status: Stage 5 of 18 — repository analysis.**
+> Two LangGraph workflows are live. The planning agent turns a natural-language
+> DevOps request into a structured execution plan via `POST /api/agent/plan`, and
+> the repository analyzer profiles a **local** repository via
+> `POST /api/repository/analyze`. Both are read-only: nothing is executed and no
+> credentials are required.
 > See [`docs/roadmap.md`](docs/roadmap.md) for what comes next.
 
 ## Stack
@@ -86,7 +87,7 @@ aegis/
 │       ├── api/       routers, error handling
 │       ├── core/      settings, logging, middleware, exceptions
 │       ├── models/    data contracts
-│       ├── services/  business logic incl. the LLM interface
+│       ├── services/  LLM interface, repository analysis
 │       └── agents/    LangGraph workflows
 ├── docs/              architecture and roadmap
 ├── docker/            nginx config and Postgres init
@@ -103,13 +104,14 @@ aegis/
 | `GET`   | `/api/v1/health`      | Aggregate health + components    |
 | `GET`   | `/api/v1/health/live` | Liveness probe                   |
 | `POST`  | `/api/agent/plan`     | Generate a DevOps execution plan |
+| `POST`  | `/api/repository/analyze` | Profile a local repository    |
 | `GET`   | `/health`             | Unversioned alias for containers |
 | `GET`   | `/docs`               | OpenAPI / Swagger UI             |
 
 Health and agent routes use different prefixes on purpose: health is a stable,
-committed surface under `/api/v1`, while the agent API is still pre-1.0 and sits
-at `/api`. Agent routes move under the versioned prefix once the response shape
-settles.
+committed surface under `/api/v1`, while the agent APIs are still pre-1.0 and sit
+at `/api`. Agent routes move under the versioned prefix once the response shapes
+settle.
 
 `/api/v1/health` reports the state of each subsystem honestly, so subsystems
 that are not built yet appear as `not_configured`:
@@ -131,6 +133,62 @@ that are not built yet appear as `not_configured`:
   ]
 }
 ```
+
+## The repository analyzer
+
+`POST /api/repository/analyze` performs a static, read-only inspection of a
+repository **on the machine running the backend**. There is no GitHub access
+yet.
+
+```bash
+curl -sS -X POST http://localhost:8000/api/repository/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"/srv/aegis/repos/my-app"}'
+```
+
+The workflow is five nodes, with path containment as the first one:
+
+```
+START → resolve_target → scan_repository → detect_stack → build_profile → END
+```
+
+It is callable on its own from Python, without HTTP:
+
+```python
+from app.agents.repository_analysis import analyze_repository_path
+
+profile = analyze_repository_path("/srv/aegis/repos/my-app")
+print(profile.primary_language, profile.frontend_framework, profile.entry_points)
+```
+
+The `RepositoryProfile` reports languages and the primary language, frontend and
+backend frameworks, package manager and package files, Dockerfile and
+docker-compose presence, test framework and test files, likely entry points,
+environment files, database usage, CI/CD systems, and README presence. A `notes`
+field records anything ambiguous, and `truncated` reports whether a scan limit
+was hit.
+
+### Treating a repository as untrusted input
+
+A repository is attacker-controlled data, so the analyzer is written defensively:
+
+| Control                | Behaviour                                                  |
+| ---------------------- | ---------------------------------------------------------- |
+| Path containment       | Resolved path must stay inside `AEGIS_REPOSITORY_ROOT`     |
+| No code execution      | Nothing is imported, `eval`'d, or run; only text is read   |
+| Symlinks skipped       | A link cannot redirect the scan outside the root           |
+| Size caps              | Files over 512 KB are skipped; 5000 files / depth 12 max   |
+| Noise pruned           | `node_modules`, `.git`, `.venv`, `dist` are not walked      |
+| Malformed manifests    | Unparseable JSON/TOML is ignored, never fatal               |
+| `.env` never opened    | Environment files are listed by name only, never read      |
+| Read-only              | Nothing is written; no lock files, no caches                |
+
+`.env` handling is deliberate: naming them is useful for planning, but reading
+them would put secrets into an HTTP response and the logs.
+
+`AEGIS_REPOSITORY_ROOT` defaults to the backend working directory, so the safe
+answer is the default. Point it at a directory only when you intend to grant
+access to it.
 
 ## The planning agent
 
@@ -200,6 +258,19 @@ cp .env.example .env
 
 **Nothing is required.** The backend boots with no configuration at all, and no
 external service is contacted at startup. Every variable is optional.
+
+### Repository analysis
+
+`AEGIS_REPOSITORY_ROOT` sets the only directory tree the analyzer may read. It
+defaults to the backend working directory, so the default denies access to
+anything else. Set it explicitly to grant access to a directory of checkouts:
+
+```bash
+AEGIS_REPOSITORY_ROOT=/srv/aegis/repos
+```
+
+A requested path is resolved and then must still land inside that root;
+otherwise the request fails with `403 permission_denied`.
 
 ### Naming
 
@@ -298,9 +369,16 @@ make typecheck     # tsc --noEmit
 ```
 
 The backend suite covers the health contract, configuration, logging, the
-correlation-ID middleware, the error envelope, and the planning graph and
-endpoint. It runs fully offline: the planner is deterministic and nothing calls
-out to a provider or a cloud API.
+correlation-ID middleware, the error envelope, the planning graph and endpoint,
+and the repository analyzer — including path traversal, symlink escapes,
+read-only guarantees and `.env` redaction.
+
+The analyzer tests generate a small fixture repository into a temporary
+directory rather than committing a sample tree, and re-point
+`AEGIS_REPOSITORY_ROOT` at it so no test can read the real source tree.
+
+Everything runs fully offline: the planner is deterministic and nothing calls
+out to a provider, a cloud API, or GitHub.
 
 ## Documentation
 

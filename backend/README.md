@@ -17,15 +17,45 @@ FastAPI service that hosts Aegis' HTTP API and the LangGraph agent runtime.
 
 ## Endpoints
 
-| Method | Path               | Purpose                          |
-| ------ | ------------------ | -------------------------------- |
-| `GET`  | `/`                | Service banner                   |
-| `GET`  | `/api/v1/health`   | Aggregate health + components    |
-| `GET`  | `/api/v1/health/live` | Liveness probe                |
-| `POST` | `/api/agent/plan`  | Generate a DevOps execution plan |
+| Method | Path                      | Purpose                          |
+| ------ | ------------------------- | -------------------------------- |
+| `GET`  | `/`                       | Service banner                   |
+| `GET`  | `/api/v1/health`          | Aggregate health + components    |
+| `GET`  | `/api/v1/health/live`     | Liveness probe                   |
+| `POST` | `/api/agent/plan`         | Generate a DevOps execution plan |
+| `POST` | `/api/repository/analyze` | Profile a local repository       |
 
-Health routes are versioned under `/api/v1`; the agent route is intentionally
-unversioned because the response shape is still pre-1.0.
+Health routes are versioned under `/api/v1`; the agent routes are intentionally
+unversioned because the response shapes are still pre-1.0.
+
+## Repository analysis
+
+`app/agents/repository_analysis.py` builds the graph:
+
+```
+START → resolve_target → scan_repository → detect_stack → build_profile → END
+```
+
+`resolve_target` is the security boundary: it resolves the requested path and
+rejects anything outside `settings.repository_root_resolved`, so `..` and
+symlink escapes fail before any node reads a file. The remaining nodes scan,
+detect, and assemble the `RepositoryProfile` from `app/models/repository.py`.
+
+Detection rules live in `app/services/repository.py` as data (extension tables
+and marker tuples), so a new language or framework is a one-line addition.
+
+Runnable without HTTP:
+
+```python
+from app.agents.repository_analysis import analyze_repository_path
+
+profile = analyze_repository_path("/srv/aegis/repos/my-app")
+```
+
+A repository is untrusted input, so the analyzer never executes or imports
+anything, skips symlinks, caps file size and count, prunes `node_modules`,
+`.git`, `.venv` and `dist`, ignores malformed manifests, and lists `.env` files
+by name only so secrets cannot reach a response or a log.
 
 ## The planning agent
 

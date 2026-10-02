@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.errors import register_exception_handlers
 from app.api.router import api_router
-from app.api.routes import agent
+from app.api.routes import agent, repository
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestLoggingMiddleware
@@ -76,10 +76,11 @@ def create_app() -> FastAPI:
 
     app.include_router(api_router, prefix=settings.api_prefix)
 
-    # Agent routes are pre-1.0 and deliberately unversioned, so planning lives at
-    # POST /api/agent/plan rather than under /api/v1. Move it under the versioned
-    # prefix once the response shape settles.
+    # Agent routes are pre-1.0 and deliberately unversioned, so planning and
+    # repository analysis live at /api/... rather than /api/v1/.... Move them
+    # under the versioned prefix once the shapes settle.
     app.include_router(agent.router, prefix="/api")
+    app.include_router(repository.router, prefix="/api")
 
     @app.get("/", response_model=RootResponse, tags=["meta"])
     def read_root() -> RootResponse:

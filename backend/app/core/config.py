@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
@@ -195,6 +196,20 @@ class Settings(BaseSettings):
     # Trust X-Forwarded-* headers only behind a proxy you control.
     trust_forwarded_headers: bool = False
 
+    # --- Repository analysis ----------------------------------------------
+    # The only directory tree the repository analyzer may read. A request path is
+    # resolved and then must still land inside this root, so ".." and symlinks
+    # cannot walk the analyzer out of it.
+    #
+    # Defaults to the backend working directory, which is the safe default:
+    # pointing AEGIS_REPOSITORY_ROOT at a checkout is what grants wider access.
+    repository_root: Path = Field(default_factory=Path.cwd)
+
+    @property
+    def repository_root_resolved(self) -> Path:
+        """Absolute, symlink-resolved form of :attr:`repository_root`."""
+        return self.repository_root.expanduser().resolve()
+
     # --- Integrations (configured only; no clients implemented yet) -------
     llm: LLMSettings = Field(default_factory=LLMSettings)
     github: GitHubSettings = Field(default_factory=GitHubSettings)
@@ -247,6 +262,9 @@ class Settings(BaseSettings):
             "api_prefix": self.api_prefix,
             "log_level": self.log_level,
             "log_format": self.log_format,
+            # Not a secret, and the single most useful thing to know when
+            # diagnosing an "outside the allowed root" rejection.
+            "repository_root": str(self.repository_root_resolved),
             "configured_integrations": self.configured_integrations(),
         }
 
