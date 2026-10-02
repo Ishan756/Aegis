@@ -6,9 +6,11 @@ Aegis is an agent that analyses a software repository, produces a deployment
 plan, deploys it through audited MCP tools, verifies the result, and investigates
 failures — escalating to a human before it does anything destructive.
 
-> **Status: Stage 1 of 18 — foundation.**
-> This repository currently contains project architecture, a FastAPI health API
-> and a React dashboard. No agent, MCP server, or deployment logic exists yet.
+> **Status: Stage 4 of 18 — first working agent.**
+> A LangGraph planning agent is live: it turns a natural-language DevOps request
+> into a structured execution plan via `POST /api/agent/plan`. Plans name the
+> tools they would use but nothing is executed yet. No MCP server, no GitHub or
+> cloud calls, and no credentials are required.
 > See [`docs/roadmap.md`](docs/roadmap.md) for what comes next.
 
 ## Stack
@@ -17,14 +19,18 @@ failures — escalating to a human before it does anything destructive.
 | ---------- | --------------------------------------------------- |
 | Frontend   | React 19, Vite 7, TypeScript 5.9                   |
 | Backend    | Python 3.11+, FastAPI, Pydantic v2, Uvicorn         |
-| Agent core | LangGraph (declared, not yet installed)             |
+| Agent core | LangGraph 1.x (optional `agent` extra)             |
 | Tooling    | Python MCP SDK (declared, not yet installed)        |
 | Storage    | PostgreSQL- and Redis-compatible design, both optional |
 | Dev env    | Docker, Docker Compose                              |
 | Config     | Environment variables via `.env`                    |
 
-LangGraph and the MCP SDK live in an optional `agent` extra so a fresh install
-stays fast while that code is still being written.
+LangGraph lives in an optional `agent` extra so a fresh install stays fast while
+the rest of the agent is still being written:
+
+```bash
+pip install -e ".[agent,dev]"   # required to run the planning agent
+```
 
 ## Quick start
 
@@ -48,7 +54,7 @@ setup to do.
 # backend
 cd backend
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[agent,dev]"   # [agent] adds LangGraph, needed for /api/agent/plan
 uvicorn app.main:app --reload --port 8000
 
 # frontend (second terminal)
@@ -77,18 +83,11 @@ aegis/
 ├── frontend/          React + Vite dashboard
 ├── backend/           FastAPI service and agent runtime
 │   └── app/
-│       ├── api/       routers and dependencies
-│       ├── core/      settings, logging
+│       ├── api/       routers, error handling
+│       ├── core/      settings, logging, middleware, exceptions
 │       ├── models/    data contracts
-│       ├── services/  business logic
-│       ├── agents/    LLM actors          (planned)
-│       ├── graph/     LangGraph workflows (planned)
-│       ├── tools/     native agent tools   (planned)
-│       ├── mcp/       MCP client layer     (planned)
-│       ├── db/        SQLAlchemy + Alembic (planned)
-│       └── cache/     Redis wrapper        (planned)
-├── mcp_servers/       MCP server contract and planned servers
-├── tests/             cross-service smoke tests
+│       ├── services/  business logic incl. the LLM interface
+│       └── agents/    LangGraph workflows
 ├── docs/              architecture and roadmap
 ├── docker/            nginx config and Postgres init
 ├── docker-compose.yml
@@ -98,13 +97,19 @@ aegis/
 
 ## API
 
-| Method | Path                     | Purpose                          |
-| ------ | ------------------------ | -------------------------------- |
-| `GET`  | `/`                      | Service banner                   |
-| `GET`  | `/api/v1/health`         | Aggregate health + components    |
-| `GET`  | `/api/v1/health/live`    | Liveness probe                   |
-| `GET`  | `/health`                | Unversioned alias for containers |
-| `GET`  | `/docs`                  | OpenAPI / Swagger UI             |
+| Method  | Path                  | Purpose                          |
+| ------- | --------------------- | -------------------------------- |
+| `GET`   | `/`                   | Service banner                   |
+| `GET`   | `/api/v1/health`      | Aggregate health + components    |
+| `GET`   | `/api/v1/health/live` | Liveness probe                   |
+| `POST`  | `/api/agent/plan`     | Generate a DevOps execution plan |
+| `GET`   | `/health`             | Unversioned alias for containers |
+| `GET`   | `/docs`               | OpenAPI / Swagger UI             |
+
+Health and agent routes use different prefixes on purpose: health is a stable,
+committed surface under `/api/v1`, while the agent API is still pre-1.0 and sits
+at `/api`. Agent routes move under the versioned prefix once the response shape
+settles.
 
 `/api/v1/health` reports the state of each subsystem honestly, so subsystems
 that are not built yet appear as `not_configured`:
@@ -116,16 +121,55 @@ that are not built yet appear as `not_configured`:
   "version": "0.1.0",
   "environment": "local",
   "uptime_seconds": 12.4,
-  "stage": "stage-1-foundation",
+  "stage": "stage-4-planning-agent",
   "components": [
     { "name": "api",      "status": "ok",              "detail": "Serving requests" },
-    { "name": "graph",    "status": "not_configured",  "detail": "LangGraph workflow pending" },
+    { "name": "graph",    "status": "ok",              "detail": "Planning graph loaded (no tools executed)" },
     { "name": "mcp",      "status": "not_configured",  "detail": "Not required yet" },
     { "name": "database", "status": "not_configured",  "detail": "Not required yet" },
     { "name": "cache",    "status": "not_configured",  "detail": "Not required yet" }
   ]
 }
 ```
+
+## The planning agent
+
+`POST /api/agent/plan` runs a LangGraph workflow and returns a plan that has been
+drafted and checked, but **not executed**.
+
+```bash
+curl -sS -X POST http://localhost:8000/api/agent/plan \
+  -H 'Content-Type: application/json' \
+  -d '{"request":"Deploy my Node.js application from the main branch."}'
+```
+
+The graph is four nodes, each a plain function over a typed state:
+
+```
+START → request_analyzer → planner → plan_validator → END
+```
+
+- **`request_analyzer`** classifies the request (task type, stack, branch,
+  environment) and records its confidence plus anything ambiguous.
+- **`planner`** calls the LLM service and returns the structured plan.
+- **`plan_validator`** checks the plan is internally consistent — sequential
+  steps, every tool declared, high risk implies human approval, verification
+  present — and fails the request with a `validation_error` if not.
+
+The plan carries an `objective`, `task_type`, `assumptions`, `required_tools`,
+ordered `steps`, `risk_level`, `requires_human_approval`, and
+`expected_verification`. Steps carry a `tool` **name**; nothing calls it yet.
+
+### Changing the model or provider
+
+Provider code lives behind one interface, `PlanningLLM`, in
+`backend/app/services/llm.py`. The graph and API only ever call
+`draft_plan(request, analysis)`.
+
+The default `HeuristicPlanningLLM` is deterministic and makes no network call,
+so the project runs and tests pass with no API key. To use a real provider, add a
+class implementing `PlanningLLM` and return it from `get_planning_llm()`. No other
+file changes.
 
 ### Errors
 
@@ -253,6 +297,11 @@ make lint          # ruff + eslint
 make typecheck     # tsc --noEmit
 ```
 
+The backend suite covers the health contract, configuration, logging, the
+correlation-ID middleware, the error envelope, and the planning graph and
+endpoint. It runs fully offline: the planner is deterministic and nothing calls
+out to a provider or a cloud API.
+
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) — component design, layering
@@ -266,5 +315,6 @@ make typecheck     # tsc --noEmit
 
 ## Licence
 
-Add a licence (MIT is a reasonable default for a student project).#   A e g i s  
+Add a licence (MIT is a reasonable default for a student project).#   A e g i s 
+ 
  

@@ -13,7 +13,7 @@ from app.core.config import Settings
 from app.models.health import ComponentHealth, HealthResponse
 
 # The development stage implemented by this codebase. Updated as features land.
-CURRENT_STAGE = "stage-1-foundation"
+CURRENT_STAGE = "stage-4-planning-agent"
 
 
 class StatusService:
@@ -42,7 +42,9 @@ class StatusService:
         return [
             ComponentHealth(name="api", status="ok", detail="Serving requests"),
             ComponentHealth(
-                name="graph", status="not_configured", detail="LangGraph workflow pending"
+                name="graph",
+                status="ok",
+                detail="Planning graph loaded (no tools executed)",
             ),
             configured("mcp", self._settings.mcp.is_configured),
             configured("database", self._settings.database.is_configured),

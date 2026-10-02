@@ -21,10 +21,11 @@ dev = [
 
 # Agent runtime. Kept optional so a plain `pip install -e .` stays fast while
 # the orchestration code is still being built out.
+# The MCP SDK is added here when the MCP stage begins; boto3 and the GitHub
+# client follow theirs.
 agent = [
-    "langgraph>=0.2.0",
-    "langchain-core>=0.3.0",
-    "mcp>=1.2.0",
+    "langgraph>=1.0.0",
+    "langchain-core>=1.0.0",
 ]
 
 [build-system]
