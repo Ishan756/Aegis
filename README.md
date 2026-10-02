@@ -6,12 +6,14 @@ Aegis is an agent that analyses a software repository, produces a deployment
 plan, deploys it through audited MCP tools, verifies the result, and investigates
 failures — escalating to a human before it does anything destructive.
 
-> **Status: Stage 5 of 18 — repository analysis.**
-> Two LangGraph workflows are live. The planning agent turns a natural-language
-> DevOps request into a structured execution plan via `POST /api/agent/plan`, and
-> the repository analyzer profiles a **local** repository via
-> `POST /api/repository/analyze`. Both are read-only: nothing is executed and no
-> credentials are required.
+> **Status: Stage 5 of 18 — MCP client layer.**
+> Three LangGraph workflows are live. The planning agent turns a natural-language
+> DevOps request into a structured execution plan via `POST /api/agent/plan`, the
+> repository analyzer profiles a **local** repository via
+> `POST /api/repository/analyze`, and the MCP layer discovers and invokes tools on
+> configured servers via `GET /api/mcp/tools` and `POST /api/mcp/tools/call`.
+> All three are read-only in practice: no external service is contacted and no
+> credentials are required. Every tool call passes a deny-by-default policy.
 > See [`docs/roadmap.md`](docs/roadmap.md) for what comes next.
 
 ## Stack
@@ -105,6 +107,8 @@ aegis/
 | `GET`   | `/api/v1/health/live` | Liveness probe                   |
 | `POST`  | `/api/agent/plan`     | Generate a DevOps execution plan |
 | `POST`  | `/api/repository/analyze` | Profile a local repository    |
+| `GET`   | `/api/mcp/tools`      | List tools from MCP servers          |
+| `POST`  | `/api/mcp/tools/call` | Invoke one MCP tool                  |
 | `GET`   | `/health`             | Unversioned alias for containers |
 | `GET`   | `/docs`               | OpenAPI / Swagger UI             |
 
@@ -127,7 +131,7 @@ that are not built yet appear as `not_configured`:
   "components": [
     { "name": "api",      "status": "ok",              "detail": "Serving requests" },
     { "name": "graph",    "status": "ok",              "detail": "Planning graph loaded (no tools executed)" },
-    { "name": "mcp",      "status": "not_configured",  "detail": "Not required yet" },
+    { "name": "mcp",      "status": "not_configured",  "detail": "Disabled; no servers configured" },
     { "name": "database", "status": "not_configured",  "detail": "Not required yet" },
     { "name": "cache",    "status": "not_configured",  "detail": "Not required yet" }
   ]
@@ -247,6 +251,95 @@ uses one envelope, so a client needs a single parsing path:
 
 `code` is stable and safe to branch on. Stack traces are never returned; they go
 to the log, correlated by `correlation_id`.
+
+## MCP integration
+
+Aegis reaches external systems through
+[Model Context Protocol](https://modelcontextprotocol.io) servers. The backend
+launches them as local `stdio` subprocesses, discovers their tools at startup,
+and runs the tool graph over them.
+
+No external servers are wired up yet. A safe demo server ships with the repo so the
+client layer can be exercised for real, without credentials.
+
+### Enabling it
+
+```bash
+# backend/.env
+AEGIS_MCP__ENABLED=true
+AEGIS_MCP__SERVERS=demo=python ../mcp_servers/demo_server.py
+```
+
+`servers` is a comma-separated list of `name=command` pairs. Commands are parsed
+with shell-style quoting but **executed without a shell**, so `sh`, `&&` and pipes
+are unavailable. Any path containing spaces must be quoted:
+
+```bash
+AEGIS_MCP__SERVERS=demo=python "/opt/my projects/mcp_servers/demo_server.py"
+```
+
+Sessions are opened once during application startup and closed on shutdown, rather
+than per request, so a tool call never pays process-spawn cost and no server
+process outlives the backend.
+
+### Trying it
+
+```bash
+curl -s localhost:8000/api/mcp/tools \
+  | jq '.tools[] | {name: .qualified_name, risk: .risk_level}'
+curl -s localhost:8000/api/mcp/tools/call \
+  -H 'content-type: application/json' \
+  -d '{"tool_name": "demo.get_system_info", "requested_by": "curl"}' | jq
+```
+
+### The tool graph
+
+```
+START → discover_tools → build_call_request → evaluate_policy → invoke_tool → END
+```
+
+The steps are separate nodes because they have different failure modes and
+different security relevance. Only `invoke_tool` can cause a side effect, and
+everything before it is metadata work that can be inspected and tested without a
+server running. `discover_tools` re-reads the registry on every run, so a call is
+always planned against the tools that exist right now rather than a stale snapshot.
+
+### Every call passes the policy
+
+`backend/app/services/mcp_policy.py` decides whether a call may proceed. It is
+deny-by-default, and refusal is the answer whenever a signal is ambiguous — a
+policy that guesses wrong in the permissive direction is a breach, not a usability
+issue.
+
+1. **The tool must have been discovered.** An invented tool name never reaches a
+   server.
+2. **Command-execution tools are refused outright**, whatever the server advertises
+   about them. A compromised or hostile server must not be able to offer Aegis a
+   shell. Argument keys are checked at any nesting depth, so
+   `{"nested": {"command": "..."}}` is refused too.
+3. **Risk comes from the server's own annotations**, and the risk in a request is
+   metadata, not authority: an agent cannot declare its own destructive call to be
+   low risk.
+4. **Anything above the approval threshold needs a human.** Read-only tools run
+   unattended; a destructive tool is refused until `approval_granted` is set, with
+   `approval_reference` recorded in the audit log.
+
+Refusals come back in the response body with `success: false` and an `error_code`
+of `policy_denied` or `approval_required`, because a refusal is a recorded outcome
+rather than a fault in the request. There is no endpoint or flag that skips the
+policy — it is a property of the architecture, not of a caller's good behaviour.
+
+### Every server is treated as untrusted input
+
+A server's tool list, descriptions and annotations are data, not instructions. It
+cannot grant itself permission by claiming a tool is read-only, and it cannot
+widen its own blast radius. Only tools discovered from configured servers are
+reachable, and only configured commands are ever launched.
+
+### Adding a server
+
+See [`mcp_servers/README.md`](mcp_servers/README.md) for the contract each server
+must follow.
 
 ## Configuration
 
@@ -393,6 +486,4 @@ out to a provider, a cloud API, or GitHub.
 
 ## Licence
 
-Add a licence (MIT is a reasonable default for a student project).#   A e g i s 
- 
- 
+Add a licence (MIT is a reasonable default for a student project).

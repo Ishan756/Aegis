@@ -10,11 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.errors import register_exception_handlers
 from app.api.router import api_router
-from app.api.routes import agent, repository
+from app.api.routes import agent, mcp, repository
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestLoggingMiddleware
 from app.models.health import RootResponse
+from app.services.mcp_manager import MCPClientManager, set_manager
 from app.services.status import StatusService
 
 logger = get_logger(__name__)
@@ -24,20 +25,36 @@ logger = get_logger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application startup and shutdown.
 
-    Long-lived resources (database pool, MCP sessions, agent graph) will be
-    opened here as later stages introduce them.
+    MCP sessions are opened here rather than per request: each server is a
+    subprocess, so reconnecting per request would pay process-spawn cost on every
+    call and could leave orphaned children. The manager is torn down on shutdown so
+    no server process outlives the app.
     """
     settings = get_settings()
-    app.state.status_service = StatusService(settings)
+    manager = MCPClientManager(settings.mcp)
+    await manager.connect()
+    app.state.mcp_manager = manager
+    set_manager(manager)
+
+    # Built after the manager so health can report which servers actually
+    # connected, rather than only whether MCP was enabled.
+    app.state.status_service = StatusService(settings, app)
 
     logger.info(
         "Aegis backend starting",
         # safe_summary() only reports whether credentials are present, never
         # their values, so this is safe to log.
-        extra={"settings": settings.safe_summary()},
+        extra={
+            "settings": settings.safe_summary(),
+            "mcp_servers": manager.connected_servers,
+        },
     )
-    yield
-    logger.info("Aegis backend shutting down")
+    try:
+        yield
+    finally:
+        set_manager(None)
+        await manager.close()
+        logger.info("Aegis backend shutting down")
 
 
 def create_app() -> FastAPI:
@@ -81,6 +98,7 @@ def create_app() -> FastAPI:
     # under the versioned prefix once the shapes settle.
     app.include_router(agent.router, prefix="/api")
     app.include_router(repository.router, prefix="/api")
+    app.include_router(mcp.router, prefix="/api")
 
     @app.get("/", response_model=RootResponse, tags=["meta"])
     def read_root() -> RootResponse:

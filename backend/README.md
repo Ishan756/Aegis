@@ -8,9 +8,9 @@ FastAPI service that hosts Aegis' HTTP API and the LangGraph agent runtime.
 | --------------------- | --------------------------------------------------------- |
 | `app/main.py`         | Application factory, middleware, lifespan                 |
 | `app/api/`            | Routers, error handlers, FastAPI dependencies             |
-| `app/api/routes/`     | One module per API area (`health`, `agent`)               |
+| `app/api/routes/`     | One module per API area (`health`, `agent`, `mcp`)        |
 | `app/core/`           | Settings, logging, request middleware, exception types    |
-| `app/models/`         | Pydantic contracts (`health`, `errors`, `planning`)       |
+| `app/models/`         | Pydantic contracts (`health`, `errors`, `planning`, `mcp`) |
 | `app/services/`       | Business logic, including the LLM provider interface      |
 | `app/agents/`         | LangGraph state graphs                                    |
 | `tests/`              | Unit and API tests                                        |
@@ -24,6 +24,8 @@ FastAPI service that hosts Aegis' HTTP API and the LangGraph agent runtime.
 | `GET`  | `/api/v1/health/live`     | Liveness probe                   |
 | `POST` | `/api/agent/plan`         | Generate a DevOps execution plan |
 | `POST` | `/api/repository/analyze` | Profile a local repository       |
+| `GET`  | `/api/mcp/tools`          | List tools from MCP servers      |
+| `POST` | `/api/mcp/tools/call`     | Invoke one MCP tool              |
 
 Health routes are versioned under `/api/v1`; the agent routes are intentionally
 unversioned because the response shapes are still pre-1.0.
@@ -87,6 +89,65 @@ The graph and API depend only on that method. The shipped
 no API key. To add a provider, implement the protocol and return the instance
 from `get_planning_llm()` — no other module changes.
 
+## MCP
+
+`app/agents/mcp_tools.py` builds the tool graph:
+
+```
+START → discover_tools → build_call_request → evaluate_policy → invoke_tool → END
+```
+
+The split is the point. Only `invoke_tool` can cause a side effect; the three nodes
+before it are metadata work that can be inspected and tested with no server running.
+`discover_tools` re-reads the registry on every run, so a call is always planned
+against the tools that exist right now.
+
+Three modules cooperate:
+
+| Module                            | Role                                              |
+| --------------------------------- | ------------------------------------------------- |
+| `app/services/mcp_manager.py`     | Process lifecycle, discovery, invocation, timeout |
+| `app/services/mcp_policy.py`      | Whether a call may proceed at all                 |
+| `app/models/mcp.py`               | Tool metadata, request, decision, result contracts |
+
+### Lifecycle
+
+Sessions are opened once in the application lifespan and closed on shutdown, not
+per request: each server is a subprocess, so reconnecting per request would pay
+process-spawn cost on every call and could leave orphaned children. `get_manager()`
+returns the single manager and raises if startup did not run, rather than lazily
+building a second set of connections that would leak.
+
+### Policy
+
+Deny-by-default, checked in order: the tool must have been discovered; command-
+execution names are refused regardless of what the server claims; an optional
+allowlist may narrow access further; argument keys are screened at any nesting
+depth; then the approval threshold is applied.
+
+Risk comes from the server's `readOnlyHint` / `destructiveHint` annotations. A
+tool with no annotation is medium risk, because the protocol default is that a tool
+may do anything. Read-only (low risk) tools run unattended; medium and above are
+refused until `approval_granted` is set.
+
+Two details worth keeping in mind when changing this code:
+
+- The risk in a `ToolCallRequest` is metadata, not authority. It is recorded for
+  the audit trail but never used to lower the assessed risk.
+- `MCPError` is not a timeout. The SDK raises a generic `MCPError` for a read that
+  exceeds `read_timeout_seconds`, so the message is matched explicitly; otherwise a
+  slow tool would be reported as a malformed call.
+
+### Configuration
+
+```bash
+AEGIS_MCP__ENABLED=true
+AEGIS_MCP__SERVERS=demo=python ../mcp_servers/demo_server.py
+```
+
+Commands are parsed with `shlex.split` and executed without a shell, so `sh`, `&&`
+and pipes are unavailable and quoting is required for paths containing spaces.
+
 ## Local development
 
 Requires [uv](https://docs.astral.sh/uv/) (or any Python 3.11+ environment).
@@ -118,11 +179,14 @@ ruff format .     # format
 
 ## Notes
 
-- LangGraph is required by the planning agent and lives in the optional `agent`
-  extra. Installing `-e ".[dev]"` alone will fail to import the graph, so use
-  `-e ".[agent,dev]"`.
-- The MCP SDK is **not** installed yet. It enters the `agent` extra when the MCP
-  stage begins.
+- LangGraph and the MCP SDK are both required by the agent runtime and live in
+  the optional `agent` extra. Installing `-e ".[dev]"` alone will fail to import
+  the graphs, so use `-e ".[agent,dev]"`.
+- The MCP SDK uses `mcp.server.mcpserver.MCPServer`; there is no `FastMCP` in the
+  current release.
+- The MCP SDK exposes snake_case attributes (`is_error`, `read_only_hint`) for
+  wire fields that are camelCase in the protocol. Code reading them checks both
+  spellings.
 - PostgreSQL and Redis are not required. If `AEGIS_DATABASE_URL` is set the
   health endpoint reports the database as configured, but no connection is
   opened yet.
