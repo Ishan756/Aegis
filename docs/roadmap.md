@@ -17,11 +17,11 @@ Legend: ✅ done · ◔ partial · ⬜ not started
 - [x] Verified: backend tests + lint, frontend typecheck + lint + test + build,
       and a live Vite → FastAPI round trip
 
-## Stage 2 — Configuration & secrets ◔
+## Stage 2 — Configuration & secrets ✅
 
-- [ ] Secret management boundary (no secrets in code or logs)
-- [ ] Typed client settings with validation
-- [ ] Request correlation IDs and structured log fields
+- [x] Secret management boundary (no secrets in code or logs)
+- [x] Typed client settings with validation
+- [x] Request correlation IDs and structured log fields
 
 ## Stage 3 — Persistence ◔
 
@@ -31,13 +31,28 @@ Legend: ✅ done · ◔ partial · ⬜ not started
 
 ## Stage 4 — Agent foundation ◔
 
-- [ ] LLM provider abstraction with a single testable fake
-- [ ] Structured output schemas for every agent response
-- [ ] Repository-analysis agent (language, build system, entrypoints, Dockerfile)
+- [x] LLM provider abstraction with a single testable fake
+- [x] Structured output schemas for every agent response
+- [x] Typed LangGraph state and a first graph: `request_analyzer → planner → plan_validator`
+- [x] `POST /api/agent/plan` returning a structured, unexecuted plan
+- [x] Repository-analysis agent over a **local path**, returning a typed
+      `RepositoryProfile`: languages, frameworks, package manager, Docker, tests,
+      entry points, env files, database usage, CI/CD, README
+- [x] `POST /api/repository/analyze`, runnable independently of HTTP
+- [ ] Feed the repository profile into the planning graph
+
+The provider boundary is the `PlanningLLM` protocol in `app/services/llm.py`. Its
+default implementation is deterministic and offline; adding a real provider is
+one class plus one factory change.
+
+The analyzer treats the repository as untrusted: no execution, symlinks skipped,
+size and depth caps, and a containment root (`AEGIS_REPOSITORY_ROOT`) that a
+request cannot escape.
 
 ## Stage 5 — Orchestration ◔
 
-- [ ] LangGraph state definition and checkpointing
+- [x] LangGraph state definition
+- [ ] Checkpointing (MemorySaver) for resumable runs
 - [ ] `analyze → plan → deploy → verify` graph
 - [ ] Human-in-the-loop approval interrupt
 
