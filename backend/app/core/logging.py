@@ -37,19 +37,6 @@ _RESERVED_RECORD_FIELDS = frozenset(logging.LogRecord("", 0, "", 0, "", None, No
 }
 
 
-class _ContextFilter(logging.Filter):
-    """Attach the active correlation ID to each record.
-
-    Retained for handlers installed outside :func:`configure_logging`; the
-    record factory below is what normally populates the field.
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        # An explicitly bound value wins over the ambient one.
-        record.correlation_id = getattr(record, "correlation_id", None) or get_correlation_id()
-        return True
-
-
 def _extra_fields(record: logging.LogRecord) -> dict[str, Any]:
     return {
         key: value
@@ -58,39 +45,33 @@ def _extra_fields(record: logging.LogRecord) -> dict[str, Any]:
     }
 
 
-class JsonFormatter(logging.Formatter):
-    """Render a record as a single-line JSON object."""
+class AegisFormatter(logging.Formatter):
+    """Render a record as JSON for aggregators, or a readable line for humans."""
+
+    def __init__(self, json_output: bool) -> None:
+        super().__init__(None if json_output else _CONSOLE_FORMAT)
+        self.json_output = json_output
 
     def format(self, record: logging.LogRecord) -> str:
+        correlation_id = getattr(record, "correlation_id", None)
+        extras = _extra_fields(record)
+
+        if not self.json_output:
+            line = super().format(record)
+            suffix = "".join(f" {k}={v}" for k, v in extras.items())
+            return f"{line} [{correlation_id}]{suffix}" if correlation_id else line + suffix
+
         payload: dict[str, Any] = {
             "timestamp": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
-            "correlation_id": getattr(record, "correlation_id", None),
+            "correlation_id": correlation_id,
+            **extras,
         }
-        payload.update(_extra_fields(record))
-
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
-
         return json.dumps(payload, default=str)
-
-
-class ConsoleFormatter(logging.Formatter):
-    """Human-readable output that still shows the correlation ID."""
-
-    def __init__(self) -> None:
-        super().__init__(_CONSOLE_FORMAT)
-
-    def format(self, record: logging.LogRecord) -> str:
-        base = super().format(record)
-        correlation_id = getattr(record, "correlation_id", None)
-        extras = _extra_fields(record)
-        suffix = "".join(f" {key}={value}" for key, value in extras.items())
-        if correlation_id:
-            return f"{base} [{correlation_id}]{suffix}"
-        return f"{base}{suffix}" if suffix else base
 
 
 # --------------------------------------------------------------------------
@@ -144,8 +125,7 @@ def configure_logging(settings: Settings) -> None:
     is not duplicated.
     """
     handler = logging.StreamHandler(sys.stdout)
-    handler.addFilter(_ContextFilter())
-    handler.setFormatter(JsonFormatter() if settings.log_format == "json" else ConsoleFormatter())
+    handler.setFormatter(AegisFormatter(json_output=settings.log_format == "json"))
 
     logging.basicConfig(
         level=settings.log_level_number,

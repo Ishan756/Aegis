@@ -10,8 +10,7 @@ import pytest
 
 from app.core.config import Settings
 from app.core.logging import (
-    ConsoleFormatter,
-    JsonFormatter,
+    AegisFormatter,
     configure_logging,
     get_correlation_id,
     get_logger,
@@ -30,7 +29,7 @@ def json_logs() -> StringIO:
     configure_logging(Settings(_env_file=None, log_format="json", log_level="DEBUG"))
 
     handler = logging.StreamHandler(stream)
-    handler.setFormatter(JsonFormatter())
+    handler.setFormatter(AegisFormatter(json_output=True))
     logging.getLogger().handlers = [handler]
     logging.getLogger().setLevel(logging.DEBUG)
 
@@ -123,7 +122,7 @@ def test_console_format_shows_correlation_id_and_extras() -> None:
     previous = logging.getLogger().handlers[:]
     configure_logging(Settings(_env_file=None, log_format="console"))
     handler = logging.StreamHandler(stream)
-    handler.setFormatter(ConsoleFormatter())
+    handler.setFormatter(AegisFormatter(json_output=False))
     logging.getLogger().handlers = [handler]
 
     token = set_correlation_id("corr-abc")
