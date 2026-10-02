@@ -18,6 +18,7 @@ needs to reason about a failed tool call rather than only catch an exception.
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import time
 from contextlib import AsyncExitStack
@@ -112,13 +113,40 @@ class MCPClientManager:
         if not argv:
             raise ValueError("empty command")
 
-        params = StdioServerParameters(command=argv[0], args=argv[1:])
+        params = StdioServerParameters(
+            command=argv[0],
+            args=argv[1:],
+            env=self._server_environment(),
+        )
         read_stream, write_stream = await self._stack.enter_async_context(stdio_client(params))
         session = await self._stack.enter_async_context(ClientSession(read_stream, write_stream))
 
         await asyncio.wait_for(session.initialize(), timeout=_CONNECT_TIMEOUT_SECONDS)
         self._sessions[name] = session
         logger.info("MCP server connected", extra={"server": name, "command": argv[0]})
+
+    def _server_environment(self) -> dict[str, str] | None:
+        """Build the environment handed to each server subprocess.
+
+        Only the variables named in ``AEGIS_MCP__FORWARD_ENVIRONMENT`` are
+        passed. The SDK merges this over its own safe allowlist, so PATH still
+        reaches the process and the interpreter can be found.
+
+        A credential travels through the environment rather than argv on purpose:
+        argv is visible to any process on the host via ``ps``, the environment of
+        another user's process is not.
+        """
+        names = self._settings.forward_environment
+        if not names:
+            return None
+        forwarded = {name: os.environ[name] for name in names if name in os.environ}
+        if forwarded:
+            logger.info(
+                "forwarding environment to MCP servers",
+                # Names only. Logging the values here would put the token in the log.
+                extra={"server": "*", "variables": sorted(forwarded)},
+            )
+        return forwarded or None
 
     async def close(self) -> None:
         """Shut every server process down."""

@@ -7,14 +7,15 @@ plan, deploys it through audited MCP tools, verifies the result, and investigate
 failures — escalating to a human before it does anything destructive.
 
 > **Status: Stage 5 of 18 — MCP client layer.**
-> Three LangGraph workflows are live. The planning agent turns a natural-language
+> Four LangGraph workflows are live. The planning agent turns a natural-language
 > DevOps request into a structured execution plan via `POST /api/agent/plan`, the
 > repository analyzer profiles a **local** repository via
-> `POST /api/repository/analyze`, and the MCP layer discovers and invokes tools on
-> configured servers via `GET /api/mcp/tools` and `POST /api/mcp/tools/call`.
-> All three are read-only in practice: no external service is contacted and no
-> credentials are required. Every tool call passes a deny-by-default policy.
-> See [`docs/roadmap.md`](docs/roadmap.md) for what comes next.
+> `POST /api/repository/analyze`, the MCP layer discovers and invokes tools on
+> configured servers via `GET /api/mcp/tools` and `POST /api/mcp/tools/call`, and
+> `POST /api/github/repository/analyze` profiles a **GitHub** repository and scores
+> its deployment readiness. All of it is read-only: no code is executed, no commit,
+> branch or pull request is created, and every tool call passes a deny-by-default
+> policy. See [`docs/roadmap.md`](docs/roadmap.md) for what comes next.
 
 ## Stack
 
@@ -109,6 +110,7 @@ aegis/
 | `POST`  | `/api/repository/analyze` | Profile a local repository    |
 | `GET`   | `/api/mcp/tools`      | List tools from MCP servers          |
 | `POST`  | `/api/mcp/tools/call` | Invoke one MCP tool                  |
+| `POST`  | `/api/github/repository/analyze` | Profile a GitHub repository and assess deployment readiness |
 | `GET`   | `/health`             | Unversioned alias for containers |
 | `GET`   | `/docs`               | OpenAPI / Swagger UI             |
 
@@ -336,6 +338,86 @@ cannot grant itself permission by claiming a tool is read-only, and it cannot
 widen its own blast radius. Only tools discovered from configured servers are
 reachable, and only configured commands are ever launched.
 
+### GitHub
+
+`mcp_servers/github/server.py` exposes read-only access to a GitHub repository:
+repository metadata, branches, commits, issues, pull requests, the file tree, and
+file contents. It has **no** tool that creates a commit, branch or pull request, and
+a test asserts that against the server's real tool list rather than trusting the
+docstring.
+
+The backend has no GitHub HTTP client. The analysis workflow asks for a tool by name
+and the MCP layer does the rest, so rate limiting, caching and transport changes are
+one layer's problem:
+
+```bash
+# backend/.env
+AEGIS_GITHUB__TOKEN=github_pat_...          # read-only is sufficient
+AEGIS_MCP__SERVERS=github=python ../mcp_servers/github/server.py
+AEGIS_MCP__FORWARD_ENVIRONMENT=AEGIS_GITHUB__TOKEN,AEGIS_GITHUB__API_URL
+```
+
+`AEGIS_MCP__FORWARD_ENVIRONMENT` is required because the MCP SDK deliberately
+inherits only a small allowlist (`PATH`, `HOME` and friends). Naming the variables
+keeps forwarding opt-in: adding a server cannot silently hand it every secret the
+backend holds. The token travels through the subprocess environment rather than
+argv, which matters because argv is visible to any process on the host via `ps`.
+
+#### Where the token can and cannot appear
+
+| Location                       | Token |
+| ------------------------------ | ----- |
+| `Authorization` request header | Yes — this is the only place it is used |
+| Backend settings `repr()`, logs, `/api/v1/health` | No — `SecretStr` masks it, and `safe_summary()` reduces it to a boolean |
+| Forwarded subprocess env       | Yes — named explicitly, values never logged |
+| Tool arguments, tool results, API responses | No |
+| Server error messages          | No — every string leaving the server passes a scrubber |
+| GitHub MCP workflow module     | No — it never reads or stores a credential |
+
+A test asserts each of those, including that scrubbing works when GitHub echoes the
+token back inside an error body.
+
+#### Analysing a repository
+
+```bash
+curl -s localhost:8000/api/github/repository/analyze \
+  -H 'content-type: application/json' \
+  -d '{"owner":"acme","repository":"checkout-service","include_issues":true}' | jq
+```
+
+```
+START → fetch_repository → inspect_files → detect_stack
+      → inspect_commits → inspect_issues → assess_readiness → END
+```
+
+`owner` and `repository` are rejected if they contain a slash or a dot segment,
+because both become URL path segments in the API request and a caller must not be
+able to address a path other than the repository they named.
+
+Stack detection is **shared** with the local analyzer. `detect_stack` reads only
+paths and manifest text, so a synthetic inventory built from remote paths produces
+the same profile without a second detector drifting out of step. That is also why
+manifest extraction is public (`extract_dependencies`) rather than duplicated.
+
+A failure to read commits or issues is recorded in `profile.notes` and the analysis
+still completes — losing context should not lose the profile. Issues you did not
+ask for are reported as `issues_inspected: false`, not as zero issues, so
+"not looked at" is never confused with "nothing open".
+
+#### Deployment readiness
+
+`assess_readiness` turns the profile into a score out of 100, a list of blockers, and
+a list of named checks showing which facts moved the score. An unexplained number
+would be impossible to act on or to argue with.
+
+Blockers are the things that make deployment unsafe or impossible: an archived
+repository, no Dockerfile, no CI, no tests. Warnings are risks worth a human's
+attention: no lockfile, a truncated file listing, a large issue backlog, multiple
+languages. `ready` is true only when there are no blockers, so a high score with a
+blocker still reports not ready.
+
+The score is a heuristic and says so in `readiness.notes`.
+
 ### Adding a server
 
 See [`mcp_servers/README.md`](mcp_servers/README.md) for the contract each server
@@ -380,15 +462,18 @@ AEGIS_DATABASE__URL=...       →  Settings.database.url
 | ---------------- | ------------------------------------------ | ------------------ |
 | `AEGIS_*`        | Service, HTTP, CORS, logging               | Yes                |
 | `AEGIS_LLM__*`   | LLM provider, model, key, timeouts         | No                 |
-| `AEGIS_GITHUB__*`| GitHub token, org, API URL                 | No                 |
-| `AEGIS_MCP__*`   | MCP enable flag, servers, approval policy   | No                 |
+| `AEGIS_GITHUB__*`| GitHub token, org, API URL (read by the MCP server) | Via MCP   |
+| `AEGIS_MCP__*`   | Enable flag, servers, forwarded env, approval policy | Yes |
 | `AEGIS_DATABASE__*` | PostgreSQL URL and pool settings        | No                 |
 | `AEGIS_REDIS__*` | Redis URL and pool settings                | No                 |
 | `AEGIS_AWS__*`   | Region, account, profile or access keys    | No                 |
 
-Sections are read and validated but perform **no I/O**. Setting
-`AEGIS_DATABASE__URL` only changes what the health endpoint reports; no
-connection is opened. boto3 and the GitHub and MCP clients are not installed.
+Sections are read and validated, but most perform **no I/O**. Setting
+`AEGIS_DATABASE__URL` only changes what the health endpoint reports; no connection
+is opened, and boto3 is not installed. The two exceptions are MCP and GitHub: MCP
+launches the servers you configure and discovers their tools at startup, and
+GitHub is reached only through the `github` MCP server rather than by a client in
+the backend.
 
 ### Credentials
 
@@ -403,6 +488,9 @@ connection is opened. boto3 and the GitHub and MCP clients are not installed.
   into a file on disk.
 - To confirm a credential is present, check `configured_integrations()` on the
   settings object, never read the value back.
+- A server launched by MCP receives credentials only if you name the variable in
+  `AEGIS_MCP__FORWARD_ENVIRONMENT`. Forwarding is opt-in per variable, and the
+  values are never logged — only the names are.
 
 ### Logging
 

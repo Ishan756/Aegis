@@ -434,8 +434,12 @@ def _text_dependencies(text: str) -> set[str]:
     return {token.lower() for token in text.replace('"', " ").replace("'", " ").split()}
 
 
-def _extract_dependencies(filename: str, text: str) -> set[str]:
-    """Dispatch to the right extractor for a manifest."""
+def extract_dependencies(filename: str, text: str) -> set[str]:
+    """Dispatch to the right extractor for a manifest.
+
+    Public because remote analysis feeds it manifest text fetched over MCP, so
+    local and GitHub repositories are parsed by the same code.
+    """
     lowered = filename.lower()
     if lowered == "package.json":
         return _package_json_dependencies(text)
@@ -501,7 +505,7 @@ def scan_repository(
             text = _read_text(path)
             if text is not None:
                 dependencies[path.relative_to(root).as_posix()] = frozenset(
-                    _extract_dependencies(path.name, text)
+                    extract_dependencies(path.name, text)
                 )
 
     return FileInventory(

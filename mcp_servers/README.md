@@ -11,7 +11,7 @@ standalone process exposing a narrow set of audited tools; the backend's
 | Server        | Tools it exposes                                     | Stage   |
 | ------------- | ---------------------------------------------------- | ------- |
 | `demo_server.py` | `get_system_info`, `get_project_files`, `get_project_status` | Shipped |
-| `github/`     | read repo, list branches, read file, open PR, read checks   | Stage 9 |
+| `github/`     | `get_repository`, `list_branches`, `list_commits`, `list_issues`, `list_pull_requests`, `list_files`, `get_file_contents` | Shipped (read-only) |
 | `docker/`     | build image, push image, inspect container, read logs       | Stage 10 |
 | `kubernetes/` | apply manifest, rollout status, pod logs                    | Stage 12 |
 | `aws/`        | describe instances, deploy, tail logs, rollback             | Stage 13 |
@@ -34,6 +34,39 @@ It is deliberately incapable of doing damage:
 
 Point it at a scratch directory with `AEGIS_DEMO_ROOT` rather than at a real
 repository.
+
+### The GitHub server
+
+`github/server.py` is read-only by construction: it exposes seven tools and none of
+them mutates anything. A test asserts this against the server's real tool list
+rather than trusting the docstring, because a docstring is not a control.
+
+It talks to the REST API with `urllib` from the standard library, so it runs anywhere
+Python does without an extra dependency.
+
+```bash
+export AEGIS_GITHUB__TOKEN=github_pat_...      # a read-only token is enough
+export AEGIS_MCP__SERVERS=github=python ../mcp_servers/github/server.py
+export AEGIS_MCP__FORWARD_ENVIRONMENT=AEGIS_GITHUB__TOKEN,AEGIS_GITHUB__API_URL
+```
+
+Anticipated failures raise the SDK's `ToolError`, so the caller receives an
+actionable message ("AEGIS_GITHUB__TOKEN is not set") instead of a generic
+"error executing tool". A plain exception would be treated as a crash and its
+message withheld — which, for the one error every operator will hit first, would be
+no message at all.
+
+### Credential rules
+
+The token is read from the environment and used in exactly one place: an
+`Authorization` header. It is never an argument, never in a result, and never in an
+error — every string leaving the module passes through `_scrub`, which covers the
+case where GitHub echoes a credential back inside an error body.
+
+The backend reaches GitHub only by asking for a tool by name. Its workflow module
+makes no HTTP request and never reads or stores a credential, so there is nowhere
+for the token to leak on that side either. (Settings do hold an `api_url` and the
+token, as `SecretStr`, because that is what gets forwarded to this server.)
 
 ## Running a server
 
@@ -90,8 +123,7 @@ mcp_servers/
   demo_server.py  # safe read-only fixtures for development and tests
   README.md
   github/
-    server.py     # MCPServer app, tool definitions
-    README.md
+    server.py     # read-only GitHub tools over the REST API
   docker/
     server.py
     README.md
