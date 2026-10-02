@@ -59,7 +59,8 @@ request cannot escape.
 ## Stage 6 — Native tools ◔
 
 - [ ] Read-only tools: filesystem, process, static analysis
-- [ ] Tool registry, schema generation, permission tagging
+- [x] Tool registry, schema generation, permission tagging (via the MCP client
+      layer; in-process tools still need their own path)
 
 ## Stage 7 — Deployment planning ◔
 
@@ -73,11 +74,16 @@ request cannot escape.
 - [ ] Log and metric collection
 - [ ] Verification report
 
-## Stage 9 — MCP foundation & GitHub ⬜
+## Stage 9 — MCP foundation & GitHub ◔
 
-- [ ] MCP client manager (discovery, connection lifecycle, timeouts)
+- [x] MCP client manager (discovery, connection lifecycle, timeouts)
+- [x] LangGraph tool graph: discover → build request → policy → invoke
+- [x] Deny-by-default execution policy (unknown tools, command execution,
+      argument screening, approval gate)
+- [x] Safe demo server (`mcp_servers/demo_server.py`) for offline development
+- [x] Approval enforcement for mutating tools
+- [x] `GET /api/mcp/tools`, `POST /api/mcp/tools/call`
 - [ ] `mcp_servers/github` — read repo, list branches, read file
-- [ ] Approval enforcement for mutating tools
 
 ## Stage 10 — MCP: Docker ⬜
 

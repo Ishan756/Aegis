@@ -8,19 +8,21 @@ probes (database, cache, MCP servers) without touching the HTTP layer.
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from app.core.config import Settings
 from app.models.health import ComponentHealth, HealthResponse
 
 # The development stage implemented by this codebase. Updated as features land.
-CURRENT_STAGE = "stage-4-planning-agent"
+CURRENT_STAGE = "stage-9-mcp-foundation"
 
 
 class StatusService:
     """Reports process and dependency health."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, app: Any | None = None) -> None:
         self._settings = settings
+        self._app = app
         self._started_at = time.monotonic()
 
     @property
@@ -39,6 +41,33 @@ class StatusService:
                 return ComponentHealth(name=name, status="ok", detail="Configured")
             return ComponentHealth(name=name, status="not_configured", detail="Not required yet")
 
+        def mcp_health() -> ComponentHealth:
+            """Report MCP as enabled but idle until the manager has connected.
+
+            The distinction matters: a server that fails to start is a degraded
+            system, not a system that was never configured.
+            """
+            mcp = self._settings.mcp
+            if not mcp.enabled:
+                return ComponentHealth(name="mcp", status="not_configured", detail="Disabled")
+            if not mcp.servers:
+                return ComponentHealth(
+                    name="mcp", status="not_configured", detail="Enabled but no servers configured"
+                )
+            manager = (
+                getattr(self._app.state, "mcp_manager", None) if self._app is not None else None
+            )
+            connected = manager.connected_servers if manager is not None else []
+            if not connected:
+                return ComponentHealth(
+                    name="mcp", status="error", detail="No MCP server could be started"
+                )
+            return ComponentHealth(
+                name="mcp",
+                status="ok",
+                detail=f"Connected: {', '.join(sorted(connected))}",
+            )
+
         return [
             ComponentHealth(name="api", status="ok", detail="Serving requests"),
             ComponentHealth(
@@ -46,7 +75,7 @@ class StatusService:
                 status="ok",
                 detail="Planning graph loaded (no tools executed)",
             ),
-            configured("mcp", self._settings.mcp.is_configured),
+            mcp_health(),
             configured("database", self._settings.database.is_configured),
             configured("cache", self._settings.redis.is_configured),
         ]
