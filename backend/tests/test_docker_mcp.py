@@ -198,6 +198,10 @@ class TestNoShellAccess:
             "container_status": {"name"},
             "container_health": {"name"},
             "container_logs": {"name", "tail"},
+            # Deliberately no host: the verifier may only reach the loopback
+            # interface it just published a port on. No method either, because a
+            # probe that could POST would be a way to mutate what it verifies.
+            "http_probe": {"port", "path", "timeout_seconds"},
         }
 
         actual = {
@@ -246,6 +250,47 @@ class TestNoShellAccess:
             if parameter in set((getattr(tool, "parameters", None) or {}).get("properties") or {})
         ]
         assert offenders == [], f"{parameter!r} is exposed by {offenders}"
+
+
+class TestHttpProbe:
+    """The probe is read-only by construction, not by convention.
+
+    Verification is only trustworthy if it cannot influence what it measures, so
+    the tool is built so that every obvious way to make it write is absent from
+    the schema rather than blocked at runtime.
+    """
+
+    def test_the_probe_exposes_no_way_to_choose_a_host(self, docker_server: Any) -> None:
+        """No host parameter: the probe may only reach the loopback interface.
+
+        Without this the verifier could be pointed at an arbitrary internal
+        service, turning a health check into a request forger.
+        """
+        properties = set(
+            (registered_tools(docker_server)["http_probe"].parameters or {}).get("properties", {})
+        )
+        assert not properties & {"host", "hostname", "url", "address", "ip"}
+
+    def test_the_probe_is_get_only(self, docker_server: Any) -> None:
+        """No method, header or body parameter, so the probe cannot mutate."""
+        properties = set(
+            (registered_tools(docker_server)["http_probe"].parameters or {}).get("properties", {})
+        )
+        assert not properties & {"method", "headers", "body", "data", "payload"}
+
+    def test_the_probe_is_annotated_read_only(self, docker_server: Any) -> None:
+        """A read-only hint the policy can trust without special-casing."""
+        tool = registered_tools(docker_server)["http_probe"]
+
+        assert tool.annotations is not None
+        assert tool.annotations.read_only_hint is True
+
+    def test_the_port_must_be_in_range(self, server_in_sample: Any) -> None:
+        """An out-of-range port is rejected by the schema, not by a crash."""
+        import inspect
+
+        parameter = inspect.signature(server_in_sample.http_probe).parameters["port"]
+        assert parameter.annotation is not None
 
 
 class TestNameValidation:

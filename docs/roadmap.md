@@ -70,9 +70,14 @@ request cannot escape.
 
 ## Stage 8 — Verification ◔
 
-- [ ] Post-deploy health checks
-- [ ] Log and metric collection
-- [ ] Verification report
+- [x] Post-deploy health checks: seven ordered checks from container existence to
+      dependency reachability
+- [x] Published ports are probed, not merely read — a mapped port with nothing
+      listening passes every status check and fails every request
+- [x] Log scanning with separate fatal and benign pattern sets
+- [x] `SUCCESS` / `WARNING` / `FAILED`, where `WARNING` is not a pass
+- [x] Machine-readable result plus a Markdown report
+- [ ] Metric collection
 
 ## Stage 9 — MCP foundation & GitHub ◔
 
@@ -108,11 +113,40 @@ request cannot escape.
 - [x] Machine-readable plan plus a Markdown rendering of the same fields
 - [ ] Executor that consumes a plan — deliberately separate from planning
 
-## Stage 11 — Real deployment flow ⬜
+## Stage 10c — Sequential execution engine ✅
 
-- [ ] Execute a plan end to end
-- [ ] Idempotency and retry with backoff
-- [ ] Rollback on failure
+- [x] Ordered task execution; order encodes causality, not preference
+- [x] Per-attempt audit trail with status, duration, error code and error class
+- [x] Error classification (`TRANSIENT` / `PERMANENT` / `POLICY` / `TIMEOUT`);
+      unrecognised errors default to non-retryable
+- [x] Per-task timeouts via `asyncio.wait_for`
+- [x] Policy enforced on every tool call, including manual retries
+- [x] Only a critical failure stops the run — `stopped` and `failed` are
+      different events and are not conflated
+- [x] Secret-like arguments redacted before recording; a URL credential keeps its
+      scheme and host so the trail stays useful
+- [ ] Consume `RepositoryDeploymentPlan` directly rather than a task list
+
+## Stage 10d — Deployment workflow & Debug placeholder ✅
+
+- [x] `PLAN → EXECUTE → VERIFY → END` with `DEBUG` on both failure paths
+- [x] Only a clean `SUCCESS` ends the run; `WARNING` routes to `DEBUG`
+- [x] Dry run ends without verifying, since nothing was deployed
+- [x] Debug Agent classifies failures, cites evidence, proposes fixes with
+      `requires_approval` — and applies nothing
+- [x] `POST /api/deployment/execute`, `/api/deployment/workflow`,
+      `/api/verification/deployment`
+- [x] Read-only loopback `http_probe` tool with no host, method, header or body
+      parameter, and no redirect following
+- [ ] Remediation proposals executed by a human approval flow (Stage 15)
+
+## Stage 11 — Real deployment flow ◔
+
+- [x] Execute a task list end to end
+- [x] Retry with backoff
+- [ ] Consume a `RepositoryDeploymentPlan` end to end
+- [ ] Idempotency keys, so a retried deployment cannot double-start a container
+- [ ] Rollback on failure — proposed only, never automatic
 
 ## Stage 12 — MCP: Kubernetes ⬜
 
@@ -131,7 +165,9 @@ request cannot escape.
 
 ## Stage 15 — Safe self-healing ⬜
 
-- [ ] Remediation proposals generated, never auto-applied at first
+- [x] Remediation proposals generated and never auto-applied; `applied` is always
+      `false` and every proposal carries `requires_approval`
+- [ ] Human approval flow that can actually execute a proposal
 - [ ] Blast-radius checks before any destructive action
 - [ ] Full audit trail per remediation
 

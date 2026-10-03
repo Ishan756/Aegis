@@ -50,6 +50,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.error
+import urllib.request
 import selectors
 import shutil
 import signal
@@ -775,7 +777,10 @@ def container_status(name: Annotated[str, Field(description="Container name.")])
         [
             "inspect",
             "--format",
-            "{{json .State}}\t{{.Config.Image}}\t{{.Created}}\t{{.RestartCount}}",
+            # Ports are appended last: the earlier fields are parsed positionally,
+            # so a new field must not shift them.
+            "{{json .State}}\t{{.Config.Image}}\t{{.Created}}\t{{.RestartCount}}"
+            "\t{{json .NetworkSettings.Ports}}",
             container_name,
         ],
         timeout=20,
@@ -791,6 +796,7 @@ def container_status(name: Annotated[str, Field(description="Container name.")])
     if len(fields) < 4:
         raise ToolError("Docker returned a container record that could not be parsed.")
     state_json, image, created, restart = fields[0], fields[1], fields[2], fields[3]
+    ports_json = fields[4] if len(fields) > 4 else "{}"
 
     try:
         state = json.loads(state_json)
@@ -814,7 +820,41 @@ def container_status(name: Annotated[str, Field(description="Container name.")])
         "image": image or None,
         "created": created or None,
         "oom_killed": bool(state.get("OOMKilled")),
+        "ports": _parse_ports(ports_json),
     }
+
+
+def _parse_ports(raw: str) -> list[dict[str, Any]]:
+    """Normalise Docker's port map into ``host_port``/``container_port`` pairs.
+
+    Unparseable input yields an empty list rather than an exception: a missing
+    port list is a gap in a verification report, not a reason to fail a status
+    read that otherwise succeeded.
+    """
+    try:
+        parsed = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+
+    ports: list[dict[str, Any]] = []
+    for container_port, bindings in parsed.items():
+        number = str(container_port).split("/")[0]
+        if not number.isdigit():
+            continue
+        for binding in bindings or []:
+            if not isinstance(binding, dict):
+                continue
+            host = binding.get("HostPort")
+            ports.append(
+                {
+                    "container_port": int(number),
+                    "host_port": int(host) if str(host).isdigit() else None,
+                    "host_ip": binding.get("HostIp") or None,
+                }
+            )
+    return sorted(ports, key=lambda item: (item["host_port"] or 0, item["container_port"]))
 
 
 @server.tool(
@@ -997,6 +1037,112 @@ def _tail(text: str, max_lines: int, max_bytes: int) -> tuple[str, bool]:
             body = body[newline + 1 :]
         truncated = True
     return body, truncated
+
+
+#: Paths a probe may request. A restricted set, because the path is the only
+#: caller-controlled part of the URL and an open path would let the probe fetch
+#: anything the host can reach.
+PROBE_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]{0,255}$")
+
+#: Loopback only. The tool builds the URL itself and takes no host parameter, so
+#: there is nothing to redirect the request elsewhere -- no SSRF surface at all.
+PROBE_HOST = "127.0.0.1"
+
+#: Upper bound on a probe's response body, so a chatty endpoint cannot exhaust
+#: memory or flood the transcript.
+MAX_PROBE_BYTES = _env_int("AEGIS_DOCKER__MAX_PROBE_BYTES", 4_000)
+
+
+def _check_probe_path(path: str) -> str:
+    """Validate a probe path. It must be a short, absolute, traversal-free path."""
+    if not path.startswith("/"):
+        raise ToolError("A probe path must start with '/'.")
+    if ".." in path:
+        raise ToolError("A probe path may not contain '..'.")
+    if not PROBE_PATH_RE.match(path):
+        raise ToolError(
+            "A probe path may contain only letters, digits and '/._~-', up to 255 characters."
+        )
+    return path
+
+
+@server.tool(
+    name="http_probe",
+    title="Probe a local HTTP endpoint",
+    description=(
+        "Issue a read-only GET to a path on a port published on this machine, and "
+        "report the status code, latency and a short body excerpt.\n\n"
+        "The host is fixed to loopback and the method is fixed to GET: there is no "
+        "parameter for either, so the request cannot be aimed at another host or "
+        "given a body. Redirects are not followed."
+    ),
+    annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True),
+)
+def http_probe(
+    port: Annotated[int, Field(description="Host port to probe.", ge=1, le=65535)],
+    path: Annotated[str, Field(description="Request path, e.g. '/health'.")] = "/",
+    timeout_seconds: Annotated[float, Field(description="Timeout in seconds.", ge=0.5, le=30.0)] = 5.0,
+) -> dict[str, Any]:
+    """Probe a loopback HTTP endpoint. Read-only."""
+    _check_port(str(port))
+    request_path = _check_probe_path(path)
+    url = f"http://{PROBE_HOST}:{port}{request_path}"
+
+    # No redirect handler, so a 302 is reported as a 302 rather than chased.
+    opener = urllib.request.build_opener(_NoRedirect)
+    request = urllib.request.Request(url, method="GET")
+    started = time.monotonic()
+
+    try:
+        with opener.open(request, timeout=timeout_seconds) as response:
+            body = response.read(MAX_PROBE_BYTES + 1)
+            status = int(response.status)
+            headers = dict(response.headers.items())
+    except urllib.error.HTTPError as error:
+        # A 404 or 500 is a real answer, not a transport failure: return it so the
+        # caller can tell "endpoint answered wrongly" from "endpoint unreachable".
+        body = error.read(MAX_PROBE_BYTES + 1)
+        status = int(error.code)
+        headers = dict(error.headers.items()) if error.headers else {}
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        reason = getattr(error, "reason", error)
+        return {
+            "reachable": False,
+            "url": url,
+            "status": None,
+            "latency_ms": round((time.monotonic() - started) * 1000, 2),
+            "error": f"{type(error).__name__}: {reason}",
+            "body": "",
+            "truncated": False,
+            "content_type": None,
+            "headers": {},
+        }
+
+    elapsed_ms = round((time.monotonic() - started) * 1000, 2)
+    truncated = len(body) > MAX_PROBE_BYTES
+    text = body[:MAX_PROBE_BYTES].decode("utf-8", errors="replace")
+
+    return {
+        "reachable": True,
+        "url": url,
+        "status": status,
+        "latency_ms": elapsed_ms,
+        "content_type": headers.get("Content-Type"),
+        "body": text,
+        "truncated": truncated,
+        "headers": {
+            key: value
+            for key, value in headers.items()
+            if key.lower() in {"content-type", "content-length", "server"}
+        },
+    }
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects, so a probe cannot be bounced to an unexpected target."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
 
 
 def _inspect_field(reference: str, template: str) -> str:

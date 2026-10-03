@@ -12,7 +12,7 @@ standalone process exposing a narrow set of audited tools; the backend's
 | ------------- | ---------------------------------------------------- | ------- |
 | `demo_server.py` | `get_system_info`, `get_project_files`, `get_project_status` | Shipped |
 | `github/`     | `get_repository`, `list_branches`, `list_commits`, `list_issues`, `list_pull_requests`, `list_files`, `get_file_contents` | Shipped (read-only) |
-| `docker/`     | `docker_available`, `list_images`, `build_image`, `start_container`, `stop_container`, `container_status`, `container_health`, `container_logs` | Shipped (writes locally) |
+| `docker/`     | `docker_available`, `list_images`, `build_image`, `start_container`, `stop_container`, `container_status`, `container_health`, `container_logs`, `http_probe` | Shipped (writes locally) |
 | `docker/`     | build image, push image, inspect container, read logs       | Stage 10 |
 | `kubernetes/` | apply manifest, rollout status, pod logs                    | Stage 12 |
 | `aws/`        | describe instances, deploy, tail logs, rollback             | Stage 13 |
@@ -71,14 +71,15 @@ token, as `SecretStr`, because that is what gets forwarded to this server.)
 
 ### The Docker server
 
-`docker/server.py` exposes eight tools over the Docker CLI. Five are read-only
+`docker/server.py` exposes nine tools over the Docker CLI. Six are read-only
 and run unattended; two change local state and need approval; one is destructive.
 
 | Tool                | Risk   | Approval | Why |
 | ------------------- | ------ | -------- | --- |
 | `docker_available`  | low    | no       | Reports CLI, daemon, version, context root |
 | `list_images`       | low    | no       | Local images with id, tag, size |
-| `container_status`  | low    | no       | Status, exit code, restart count, health |
+| `container_status`  | low    | no       | Status, exit code, restart count, health, published ports |
+| `http_probe`        | low    | no       | `GET` a loopback port, no redirects followed |
 | `container_health`  | low    | no       | Health check status, last output, failing streak |
 | `container_logs`    | low    | no       | Capped tail of stdout and stderr |
 | `build_image`       | medium | **yes**  | Executes the Dockerfile's `RUN` steps |
@@ -87,6 +88,10 @@ and run unattended; two change local state and need approval; one is destructive
 
 How it avoids being a shell:
 
+- **The probe cannot be pointed anywhere.** `http_probe` takes `port`, `path` and
+  `timeout_seconds` only — no host, method, headers or body — and resolves to
+  `127.0.0.1`. Redirects are not followed, because a `302` to an error page is a
+  finding, and following it would turn a real failure into a green check.
 - **Argument lists, `shell=False`, always.** There is no tool that takes a
   command string, and `start_container` appends the image *last* with no
   parameter after it, so `sh -c ...` cannot be smuggled in as an override.

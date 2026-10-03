@@ -29,6 +29,10 @@ FastAPI service that hosts Aegis' HTTP API and the LangGraph agent runtime.
 | `POST` | `/api/github/repository/analyze` | Profile a GitHub repository and score deployment readiness |
 | `GET`  | `/api/docker/availability`  | Report whether the Docker daemon is reachable |
 | `POST` | `/api/docker/deploy`        | Build, run, health-check and log a local container |
+| `POST` | `/api/deployment/plan`      | Plan a deployment from a GitHub repository |
+| `POST` | `/api/deployment/execute`   | Run an ordered task list with retries, timeouts and approvals |
+| `POST` | `/api/deployment/workflow`  | PLAN → EXECUTE → VERIFY → END, with DEBUG on failure |
+| `POST` | `/api/verification/deployment` | Verify a deployed container against seven checks |
 
 Health routes are versioned under `/api/v1`; the agent routes are intentionally
 unversioned because the response shapes are still pre-1.0.
@@ -215,6 +219,128 @@ Three behaviours are deliberate and worth preserving:
 
 `dry_run: true` inspects and reports the plan without building or running
 anything.
+
+## Execution and verification
+
+Three modules, three separate concerns:
+
+| Module | Responsibility |
+| ------ | -------------- |
+| `app/agents/execution_engine.py` | Run tasks in order, and record what happened |
+| `app/agents/deployment_verification.py` | Decide whether the deployment is actually healthy |
+| `app/agents/debug_agent.py` | Explain a failure and propose fixes, applying nothing |
+
+### The executor
+
+`execute_run` takes an ordered `Task` list and runs it sequentially. Sequential
+because order encodes causality: nothing that needs an image runs before the
+build, and nothing that needs a container runs before the run.
+
+Every attempt becomes an `Action` recording the task, tool, redacted arguments,
+status, duration, error code and error class. That record is the audit trail, and
+it is written per attempt, so a retried task leaves one entry per try rather than
+only the last outcome.
+
+Failures are classified, not just counted:
+
+| Class | Retried | Examples |
+| ----- | ------- | -------- |
+| `TRANSIENT` | yes | daemon restarting, image pull timeout |
+| `PERMANENT` | no | no such image, port already allocated, bad Dockerfile |
+| `POLICY` | no | refused by the approval gate |
+| `TIMEOUT` | yes, if attempts remain | the tool exceeded its budget |
+
+Anything unrecognised is `PERMANENT`. Defaulting unknown failures to retryable
+means a typo in a tool name turns into a loop; a tool that is merely *not known*
+to be safe should be treated as unsafe.
+
+Only a **critical** task failure stops the run. That distinction is deliberate:
+`stopped` means the plan was halted part-way, which is a different event from a
+task that simply failed, and reporting both as "stopped" would hide the fact that
+nothing after the failure was ever attempted.
+
+Arguments are redacted before they are recorded. Keys that look like secrets go
+entirely; a URL that merely *contains* a credential keeps its scheme and host, so
+the trail stays useful:
+
+```
+{"password": "hunter2"}                        -> {"password": "***redacted***"}
+{"dsn": "postgres://u:p@h/db"}                 -> {"dsn": "***redacted***"}
+{"DATABASE_URL": "postgres://u:p@h:5432/db"}   -> {"DATABASE_URL": "postgres://***redacted***@h:5432/db"}
+```
+
+### The verifier
+
+Seven checks, always in this order:
+
+| # | Check | Question |
+| - | ----- | -------- |
+| 1 | `container_exists` | Is there a container at all? |
+| 2 | `container_running` | Is it running, and was it OOM-killed? |
+| 3 | `port_available` | Is the port published **and** answering? |
+| 4 | `health_endpoint` | Does the health path respond? |
+| 5 | `health_status_code` | Is the status the one we expected? |
+| 6 | `logs_clean` | Do the logs contain a real error? |
+| 7 | `dependencies_reachable` | Can declared dependencies be reached? |
+
+Two of these carry more weight than they look like they do.
+
+**Check 3 probes the port.** A mapped port is a Docker promise, not evidence.
+A container can publish `8080:8000` and have nothing listening, which passes
+every status check and fails every request. The check therefore has to make a
+request, not read a mapping.
+
+**Check 6 needs both patterns.** Fatal patterns catch `panic`,
+`Traceback (most recent call last)`, `ECONNREFUSED`, `out of memory` and friends.
+Benign patterns are checked first and catch `ERROR_CODE=0`, `no errors during
+startup`, `Errors logged: 0` — because a verifier that cries wolf on
+`ERROR_CODE=0` gets switched off, and a verifier nobody trusts is worse than no
+verifier. Go and Node print symbolic errno names, so `ECONNREFUSED` is matched
+explicitly; a prose-only pattern list misses it completely.
+
+The result is `SUCCESS`, `WARNING` or `FAILED`, and **`WARNING` is not a pass**.
+A check that could not run because a prerequisite was missing is a warning,
+because absence of evidence is not evidence of health. A check that does not
+apply at all — no declared dependencies — is ignored; conflating the two would
+make `WARNING` the outcome of every healthy deployment, and a warning that always
+fires is one nobody reads.
+
+Verification is strictly read-only. It cannot restart, rebuild or roll anything
+back, because an agent that repairs its own deployment destroys the evidence that
+tells you the deployment is broken.
+
+### The Debug Agent is a placeholder
+
+On a stopped execution or a non-`SUCCESS` verification the graph routes to
+`app/agents/debug_agent.py`. It classifies the failure, cites the evidence for
+each hypothesis, and proposes remediations with `requires_approval` set. It
+applies nothing: `applied` is always `False` and `applied_action` is always
+`None`.
+
+This is on purpose. A debug agent that restarts containers and reruns builds
+will retry indefinitely against a cause it cannot see, and it erases the logs and
+exit code you needed. Proposals need a human, which is what `requires_approval`
+is for.
+
+### The workflow
+
+```
+START → PLAN → EXECUTE → VERIFY → END
+                 │         │
+                 ▼         ▼
+               DEBUG ◄─────┘
+```
+
+```
+PLAN → EXECUTE → VERIFY → END   clean success
+      EXECUTE stopped ─────────▶ DEBUG
+      VERIFY WARNING/FAILED ───▶ DEBUG
+      dry_run ─────────────────▶ END
+```
+
+Only a clean `SUCCESS` ends the run. A dry run ends without verifying anything,
+because nothing was deployed — running the verifier anyway would report on a
+container that does not exist, which is a false failure rather than a useful one.
 
 ## Local development
 

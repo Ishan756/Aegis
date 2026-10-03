@@ -425,9 +425,10 @@ The score is a heuristic and says so in `readiness.notes`.
 
 ### Docker
 
-`mcp_servers/docker/server.py` exposes eight tools over the Docker CLI: availability,
-image listing, build, start, stop, status, health and logs. Five are read-only. Two
-change local state and one is destructive, and all three require approval.
+`mcp_servers/docker/server.py` exposes nine tools over the Docker CLI: availability,
+image listing, build, start, stop, status, health, logs and an HTTP probe. Six are
+read-only. Two change local state and one is destructive, and all three require
+approval.
 
 ```bash
 # backend/.env
@@ -452,6 +453,9 @@ rot.
 | Mount a volume or pass env | Both are ways to hand a container the host's filesystem or credentials. The tests whitelist the entire parameter surface, so adding one fails the build rather than shipping. |
 | Pass build args | A build argument is a reliable way to bake a secret into an image layer. |
 | Pass environment variables to the build | The child's environment is an allowlist — `PATH`, `HOME`, Docker connection settings and `AEGIS_DOCKER__*` only. A Dockerfile's `RUN` step cannot read the backend's LLM or GitHub credentials. |
+| Choose a probe host | `http_probe` has no `host` parameter and resolves to `127.0.0.1` only. A verifier that could be pointed at an arbitrary internal service would be a request forger, not a health check. |
+| Choose a probe method, headers or body | The probe is `GET` and nothing else. Verification that can mutate what it verifies is not verification. |
+| Follow a redirect | The probe reports what the endpoint actually returned. A `302` to an error page is a finding, and hiding it behind a followed redirect would turn a real failure into a green check. |
 
 Beyond that: names starting with `-` are rejected so they cannot be read as Docker
 flags; build contexts are confined to `context_root` with symlinks resolved *before*
@@ -480,6 +484,111 @@ START → inspect_repository → build_image → start_container → check_healt
 container that is merely running is not reported as a working deployment. Without
 `approve: true` the build and run stages are refused and say so, rather than being
 quietly skipped. Use `dry_run: true` to inspect without building anything.
+
+### Deployment verification
+
+Planning produces a plan. Verification decides whether the thing that was built
+actually works — which is a different question, and the one that matters.
+
+```bash
+curl -s localhost:8000/api/deployment/workflow \
+  -H 'content-type: application/json' \
+  -d '{"repository_path":"../examples/sample_app","image":"aegis-sample:dev",
+       "container_name":"aegis-sample","ports":["8080:8000"],
+       "approve":true,"approval_reference":"your-name"}' | jq
+```
+
+```
+START → PLAN → EXECUTE → VERIFY → END
+                 │         │
+                 ▼         ▼
+               DEBUG ◄─────┘
+```
+
+#### Seven checks, always in order
+
+| # | Check | Question |
+| - | ----- | -------- |
+| 1 | `container_exists` | Is there a container at all? |
+| 2 | `container_running` | Is it running, and was it OOM-killed? |
+| 3 | `port_available` | Is the port published **and** answering? |
+| 4 | `health_endpoint` | Does the health path respond? |
+| 5 | `health_status_code` | Is the status the one we expected? |
+| 6 | `logs_clean` | Do the logs contain a real error? |
+| 7 | `dependencies_reachable` | Can declared dependencies be reached? |
+
+Two carry more weight than they appear to.
+
+**Check 3 makes a request.** A published port is a Docker promise, not evidence.
+A container can map `8080:8000` and have nothing listening — passing every status
+check while failing every request. So the check probes the port instead of
+reading the mapping.
+
+**Check 6 needs fatal *and* benign patterns.** `panic`, `Traceback`, `ECONNREFUSED`
+and `out of memory` are fatal. `ERROR_CODE=0`, `no errors during startup` and
+`Errors logged: 0` are not, and are matched first. A verifier that flags
+`ERROR_CODE=0` gets switched off, and a verifier nobody trusts is worse than no
+verifier. Symbolic errno names are matched explicitly, because Go and Node print
+`connect ECONNREFUSED 127.0.0.1:5432` and a prose-only pattern list misses it.
+
+#### Three outcomes, and one of them is not a pass
+
+| Status | Meaning |
+| ------ | ------- |
+| `SUCCESS` | Every check that applies passed |
+| `WARNING` | Nothing failed, but something is unproven — a check could not run |
+| `FAILED` | At least one check failed |
+
+`WARNING` is **not** a pass, and `passed` is `false` for it. A check skipped
+because a prerequisite was missing is a warning, because absence of evidence is
+not evidence of health. A check that does not apply at all — no declared
+dependencies — is ignored; conflating those two would make `WARNING` the outcome
+of every healthy deployment, and a warning that always fires is one nobody reads.
+
+#### Verification never repairs
+
+The verifier is read-only: it cannot restart, rebuild or roll anything back. An
+agent that repairs its own deployment destroys the exit code and logs you needed
+to diagnose it.
+
+So failures route to `app/agents/debug_agent.py`, which classifies the failure,
+cites the evidence behind each hypothesis, and proposes fixes with
+`requires_approval` set. It applies nothing — `applied` is always `false`. This is
+deliberately a placeholder: a debug agent that restarts and reruns retries forever
+against a cause it cannot see.
+
+#### The executor underneath
+
+`POST /api/deployment/execute` runs a task list on its own. Tasks run
+sequentially because order encodes causality, and every attempt is recorded with
+its redacted arguments, status, duration, error code and error class.
+
+Failures are classified rather than counted, so the retry decision is defensible:
+
+| Class | Retried |
+| ----- | ------- |
+| `TRANSIENT` | yes |
+| `PERMANENT` | no |
+| `POLICY` | no |
+| `TIMEOUT` | yes, if attempts remain |
+
+Anything unrecognised is `PERMANENT`. Defaulting unknown failures to retryable
+turns a typo in a tool name into a loop.
+
+Only a **critical** task failure stops the run. `stopped` means the plan was
+halted part-way, which is a different event from a task that merely failed, and
+collapsing the two hides the fact that nothing after the failure was attempted.
+
+Arguments are redacted before they are recorded — a secret-looking key goes
+entirely, while a URL that merely contains a credential keeps its scheme and host
+so the trail stays useful:
+
+```
+{"password": "hunter2"}                      -> {"password": "***redacted***"}
+{"dsn": "postgres://u:p@h/db"}               -> {"dsn": "***redacted***"}
+{"DATABASE_URL": "postgres://u:p@h:5432/db"} -> {"DATABASE_URL": "postgres://***redacted***@h:5432/db"}
+{"image": "aegis-sample:dev"}                -> {"image": "aegis-sample:dev"}
+```
 
 ### Deployment planning
 
