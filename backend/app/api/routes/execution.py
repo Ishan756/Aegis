@@ -9,6 +9,7 @@ from fastapi.responses import PlainTextResponse
 
 from app.agents.deployment_workflow import run_deployment_workflow
 from app.agents.execution_engine import execute_run
+from app.core.config import get_settings
 from app.models.docker import DockerDeployRequest
 from app.models.execution import ExecutionRequest, ExecutionResponse
 
@@ -70,7 +71,18 @@ async def run_workflow_endpoint(
     format: Literal["json", "markdown"] = "json",  # noqa: A002 - the documented query name
 ) -> dict[str, Any] | PlainTextResponse:
     """Plan, execute and verify one local deployment."""
-    outcome: dict[str, Any] = await run_deployment_workflow(payload)
+    # From settings, not a request field: the bounds on automatic recovery are a
+    # property of the deployment, not something each caller supplies. Disabled by
+    # default, so an unmodified install still diagnoses and escalates.
+    #
+    # `human_approved` is deliberately left False. This endpoint cannot approve on
+    # a caller's behalf; a human authorises an escalated fix through
+    # `POST /api/deployment/recover`, where the approval is explicit.
+    outcome: dict[str, Any] = await run_deployment_workflow(
+        payload,
+        self_healing_policy=get_settings().self_healing.to_policy(),
+        self_healing_human_approved=False,
+    )
 
     if format == "markdown":
         lines = ["# Deployment workflow", ""]
@@ -102,6 +114,26 @@ async def run_workflow_endpoint(
                         f"[{proposal.tool or 'manual'}, approval required]"
                     )
                 lines.append("")
+        incident = outcome.get("incident")
+        if incident is not None:
+            lines += [f"# Incident\n\n{incident.next_action}\n", ""]
+            lines += ["## Evidence", ""]
+            for item in incident.evidence:
+                lines.append(f"- {item.summary()}")
+            lines.append("")
+            lines += ["## Suspected root causes", ""]
+            for cause in incident.suspected_root_causes or []:
+                lines.append(f"- **{cause.id}** ({cause.confidence}) — {cause.cause}")
+            lines.append("")
+        recovery = outcome.get("recovery")
+        if recovery is not None:
+            lines += [f"# Recovery — {recovery.summary()}\n", ""]
+            lines += ["## Attempts", ""]
+            for attempt in recovery.attempts:
+                lines.append(f"- {attempt.summary()}")
+            if recovery.next_action:
+                lines += ["", f"Next: {recovery.next_action}"]
+            lines.append("")
         return PlainTextResponse("\n".join(lines), media_type="text/plain; charset=utf-8")
 
     return outcome

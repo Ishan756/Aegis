@@ -116,6 +116,9 @@ aegis/
 | `POST`  | `/api/github/repository/analyze` | Profile a GitHub repository and assess deployment readiness |
 | `POST`  | `/api/docker/deploy` | Build, run, health-check and log a container locally |
 | `POST`  | `/api/deployment/plan` | Turn a GitHub repository into an ordered deployment plan |
+| `POST`  | `/api/deployment/workflow` | PLAN → EXECUTE → VERIFY, then DEBUG and bounded RECOVER on failure |
+| `POST`  | `/api/deployment/incident` | Investigate a failure read-only and report an evidence-backed cause |
+| `POST`  | `/api/deployment/recover`  | Attempt bounded, policy-gated automatic recovery |
 | `GET`   | `/health`             | Unversioned alias for containers |
 | `GET`   | `/docs`               | OpenAPI / Swagger UI             |
 
@@ -502,7 +505,9 @@ curl -s localhost:8000/api/deployment/workflow \
 START → PLAN → EXECUTE → VERIFY → END
                  │         │
                  ▼         ▼
-               DEBUG ◄─────┘
+               DEBUG ──▶ RECOVER ──▶ END
+                 ▲         │
+                 └─────────┘  bounded retry loop
 ```
 
 #### Seven checks, always in order
@@ -547,15 +552,78 @@ of every healthy deployment, and a warning that always fires is one nobody reads
 
 #### Verification never repairs
 
-The verifier is read-only: it cannot restart, rebuild or roll anything back. An
-agent that repairs its own deployment destroys the exit code and logs you needed
-to diagnose it.
+The **verifier** is read-only: it cannot restart, rebuild or roll anything back.
+An agent that repairs its own deployment before you have looked at it destroys the
+exit code and logs you needed to diagnose it.
 
-So failures route to `app/agents/debug_agent.py`, which classifies the failure,
-cites the evidence behind each hypothesis, and proposes fixes with
-`requires_approval` set. It applies nothing — `applied` is always `false`. This is
-deliberately a placeholder: a debug agent that restarts and reruns retries forever
-against a cause it cannot see.
+So a failure first routes to `DEBUG` and then to a **separate** `RECOVER` node.
+Splitting them means the diagnosis is produced whether or not acting on it is
+allowed — ask for a report with self-healing switched off and you still get one.
+
+#### Evidence before cause
+
+`app/agents/investigation.py` collects evidence with read-only tools only:
+container status, health and logs, a loopback-only HTTP probe, recent commits, and
+the repository's own Dockerfile and configuration.
+
+Every suspected root cause cites the observations supporting it, and a cause with
+no evidence is rejected by the model rather than filtered out afterwards.
+Confidence comes from how many *independent* sources corroborate a cause — one
+log line matching a regex is `low`, not `high`. When nothing matches a known
+signature the report says so instead of inventing one.
+
+```bash
+curl -s localhost:8000/api/deployment/incident \
+  -H 'content-type: application/json' \
+  -d '{"container_name":"aegis-sample","port":8080}' | jq
+```
+
+#### Bounded, and deliberately unequipped
+
+The recovery loop is `DEBUG → ROOT CAUSE → FIX RECOMMENDATION → RISK CHECK →
+APPLY FIX → REDEPLOY → VERIFY`, looping only while budget remains.
+
+It is bounded twice: by `max_recovery_attempts` (capped at 10) and by an
+independent step limit, so a routing bug cannot make it unbounded. A fix that
+errors still consumes its attempt, and skips the redeploy — the container may be
+down, and verifying it would measure something nobody started.
+
+Automatic application is limited to **non-destructive** actions: retry the
+deployment, retry a transient step, restart the container. Rebuilding an image
+needs `allow_rebuild` *and* a human, because it re-executes the Dockerfile's `RUN`
+steps. Code and configuration changes are `FORBIDDEN` under every setting — there
+is no flag that enables them, because a flag that disables a safety guarantee is
+worse than no flag.
+
+Two consequences worth stating plainly:
+
+- **A restart is refused when nothing can start the container again.**
+  `restart_container` is really a stop. With no redeploy path available the loop
+  records the refusal and changes nothing, rather than taking a working service
+  down and leaving it down.
+- **Approval is a request field, never a graph decision.** `human_approved` comes
+  from the caller; nothing inside the loop can set it. That is what stops an agent
+  approving its own remediation.
+
+Every pass records a `RecoveryAttempt` and logs it, whether it acted or declined.
+Declined attempts are recorded too — a refusal with no record is
+indistinguishable from the loop never having run.
+
+Defaults are the safe end of every axis: `enabled=false`,
+`max_recovery_attempts=2`, `min_confidence=medium`, `allow_restart=true`,
+`allow_retry=true`, `allow_rebuild=false`. An unmodified install diagnoses and
+escalates, and changes nothing.
+
+```bash
+# Turn automatic recovery on, at most three attempts, confidence high.
+AEGIS_SELF_HEALING__ENABLED=true
+AEGIS_SELF_HEALING__MAX_RECOVERY_ATTEMPTS=3
+AEGIS_SELF_HEALING__MIN_CONFIDENCE=high
+```
+
+There is no `AEGIS_SELF_HEALING__ALLOW_DESTRUCTIVE` or `..._ALLOW_CODE_CHANGES`,
+deliberately. `max_recovery_attempts` is capped at 10 by the settings schema, so
+no environment file can configure a loop without an end.
 
 #### The executor underneath
 
@@ -697,6 +765,7 @@ AEGIS_DATABASE__URL=...       →  Settings.database.url
 | `AEGIS_DATABASE__*` | PostgreSQL URL and pool settings        | No                 |
 | `AEGIS_REDIS__*` | Redis URL and pool settings                | No                 |
 | `AEGIS_AWS__*`   | Region, account, profile or access keys    | No                 |
+| `AEGIS_SELF_HEALING__*` | Recovery bounds and permissions (off by default) | Yes |
 
 Sections are read and validated, but most perform **no I/O**. Setting
 `AEGIS_DATABASE__URL` only changes what the health endpoint reports; no connection

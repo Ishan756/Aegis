@@ -25,6 +25,8 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from app.models.self_healing import SelfHealingPolicy
+
 Environment = Literal["local", "dev", "staging", "prod"]
 
 _LOG_LEVELS: dict[str, int] = {
@@ -108,6 +110,57 @@ class DockerSettings(_Section):
     def context_root_resolved(self) -> Path:
         """Absolute, symlink-resolved form of :attr:`context_root`."""
         return self.context_root.expanduser().resolve()
+
+
+class SelfHealingSettings(_Section):
+    """Bounds on automatic recovery.
+
+    Defaults are the safe end of every axis: ``enabled=False``, so a fresh
+    install diagnoses and escalates rather than acting. Turning it on is a
+    deliberate choice, and ``max_recovery_attempts`` is capped at 10 because a
+    loop that can retry without limit is an outage with extra steps.
+
+    There is no ``allow_destructive`` or ``allow_code_changes`` setting, and that
+    omission is intentional. Those are not things a flag should switch on; see
+    :mod:`app.models.self_healing`.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Master switch for automatic recovery. False diagnoses only.",
+    )
+    max_recovery_attempts: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+        description="Total automatic attempts per incident, including the first.",
+    )
+    min_confidence: Literal["low", "medium", "high"] = Field(
+        default="medium",
+        description="Below this the loop stops and escalates to a human.",
+    )
+    allow_restart: bool = Field(
+        default=True, description="Permit automatic restart of a failed container."
+    )
+    allow_rebuild: bool = Field(
+        default=False,
+        description=(
+            "Permit automatic image rebuild. Off by default: a rebuild executes the "
+            "Dockerfile's RUN steps against untrusted input."
+        ),
+    )
+    allow_retry: bool = Field(default=True, description="Permit retrying the deployment.")
+
+    def to_policy(self) -> SelfHealingPolicy:
+        """Convert settings into the policy the loop is checked against."""
+        return SelfHealingPolicy(
+            enabled=self.enabled,
+            max_recovery_attempts=self.max_recovery_attempts,
+            min_confidence=self.min_confidence,
+            allow_restart=self.allow_restart,
+            allow_rebuild=self.allow_rebuild,
+            allow_retry=self.allow_retry,
+        )
 
 
 class MCPSettings(_Section):
@@ -271,6 +324,7 @@ class Settings(BaseSettings):
     github: GitHubSettings = Field(default_factory=GitHubSettings)
     mcp: MCPSettings = Field(default_factory=MCPSettings)
     docker: DockerSettings = Field(default_factory=DockerSettings)
+    self_healing: SelfHealingSettings = Field(default_factory=SelfHealingSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     aws: AWSSettings = Field(default_factory=AWSSettings)

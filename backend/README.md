@@ -33,6 +33,8 @@ FastAPI service that hosts Aegis' HTTP API and the LangGraph agent runtime.
 | `POST` | `/api/deployment/execute`   | Run an ordered task list with retries, timeouts and approvals |
 | `POST` | `/api/deployment/workflow`  | PLAN → EXECUTE → VERIFY → END, with DEBUG on failure |
 | `POST` | `/api/verification/deployment` | Verify a deployed container against seven checks |
+| `POST` | `/api/deployment/incident`   | Investigate a failure read-only and report an evidence-backed cause |
+| `POST` | `/api/deployment/recover`    | Attempt bounded, policy-gated automatic recovery |
 
 Health routes are versioned under `/api/v1`; the agent routes are intentionally
 unversioned because the response shapes are still pre-1.0.
@@ -309,26 +311,15 @@ Verification is strictly read-only. It cannot restart, rebuild or roll anything
 back, because an agent that repairs its own deployment destroys the evidence that
 tells you the deployment is broken.
 
-### The Debug Agent is a placeholder
-
-On a stopped execution or a non-`SUCCESS` verification the graph routes to
-`app/agents/debug_agent.py`. It classifies the failure, cites the evidence for
-each hypothesis, and proposes remediations with `requires_approval` set. It
-applies nothing: `applied` is always `False` and `applied_action` is always
-`None`.
-
-This is on purpose. A debug agent that restarts containers and reruns builds
-will retry indefinitely against a cause it cannot see, and it erases the logs and
-exit code you needed. Proposals need a human, which is what `requires_approval`
-is for.
-
 ### The workflow
 
 ```
 START → PLAN → EXECUTE → VERIFY → END
                  │         │
                  ▼         ▼
-               DEBUG ◄─────┘
+               DEBUG ──▶ RECOVER ──▶ END
+                 ▲         │
+                 └─────────┘  bounded retry loop
 ```
 
 ```
@@ -341,6 +332,83 @@ PLAN → EXECUTE → VERIFY → END   clean success
 Only a clean `SUCCESS` ends the run. A dry run ends without verifying anything,
 because nothing was deployed — running the verifier anyway would report on a
 container that does not exist, which is a false failure rather than a useful one.
+
+## Investigation and self-healing
+
+A failure routes to `DEBUG`, then to `RECOVER`. The two are separate nodes so the
+diagnosis is produced whether or not acting on it is permitted — `POST
+/api/deployment/recover` with self-healing disabled still returns a full report.
+
+### The investigation agent
+
+`app/agents/investigation.py` gathers evidence with **read-only tools only**:
+
+- container status, health and logs
+- a loopback-only, GET-only, redirect-free HTTP probe
+- recent GitHub commits
+- the repository's own Dockerfile and configuration
+
+Every suspected root cause **cites the observations that support it**, and a cause
+with no evidence is rejected by the model rather than filtered out afterwards.
+Confidence is derived from how many *independent* sources corroborate a cause —
+one log line that happens to match a regex is `low`, not `high`. When the
+evidence matches no known signature the report says so rather than guessing.
+
+### The recovery loop
+
+`app/agents/recovery_workflow.py` runs:
+
+```
+DEBUG → ROOT CAUSE → FIX RECOMMENDATION → RISK CHECK → APPLY FIX → REDEPLOY → VERIFY
+           │                                                                    │
+           └──────────────────────────── ESCALATE ◄──────────────────────────────┘
+```
+
+The loop is bounded twice over: by `max_recovery_attempts`, and by an independent
+LangGraph step limit, so a routing bug cannot make it unbounded. A fix that errors
+consumes its attempt and skips the redeploy — the container may be down, and
+verifying it would measure something nobody started.
+
+What may happen automatically:
+
+| Action                 | Category          | Automatic?                     |
+| ---------------------- | ----------------- | ------------------------------ |
+| Retry the deployment   | `retry_deployment`| yes, if confidence allows      |
+| Retry a transient step | `retry_transient` | yes, if confidence allows      |
+| Restart the container  | `restart_container` | yes, if a redeploy can start it again |
+| Rebuild the image      | `rebuild_image`   | no — `allow_rebuild` + approval |
+| Change code            | `code`            | never, under any setting       |
+| Change configuration   | `configuration`   | never, under any setting       |
+
+There is deliberately **no** `allow_destructive` or `allow_code_changes` setting.
+A flag that disables a safety guarantee is worse than no flag, so the categories
+that must never run unattended are a hard `FORBIDDEN` rather than a default.
+
+Two consequences worth stating plainly:
+
+- **A restart is refused when the caller cannot start the container again.**
+  `restart_container` is really a stop. Without a redeploy path to start it, the
+  loop records the refusal and changes nothing, because the alternative is
+  taking a working service down and leaving it down.
+- **Approval is a request field, never a graph decision.** `human_approved`
+  arrives from the caller; nothing inside the loop can set it. That is what stops
+  an agent approving its own remediation.
+
+Defaults (`AEGIS_SELF_HEALING__*`): `enabled=false`, `max_recovery_attempts=2`,
+`min_confidence=medium`, `allow_restart=true`, `allow_retry=true`,
+`allow_rebuild=false`. A fresh install diagnoses and escalates.
+
+```bash
+AEGIS_SELF_HEALING__ENABLED=true
+AEGIS_SELF_HEALING__MAX_RECOVERY_ATTEMPTS=3
+```
+
+`max_recovery_attempts` is capped at 10 by the settings schema. There is
+deliberately no `ALLOW_DESTRUCTIVE` or `ALLOW_CODE_CHANGES`.
+
+Every pass appends a `RecoveryAttempt` and emits a structured log line, whether
+it acted or declined. Declined attempts are recorded too — a refusal with no
+record is indistinguishable from the loop never having run.
 
 ## Local development
 

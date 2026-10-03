@@ -17,6 +17,7 @@ from app.api.routes import (
     execution,
     github,
     mcp,
+    recovery,
     repository,
     verification,
 )
@@ -112,6 +113,7 @@ def create_app() -> FastAPI:
     app.include_router(deployment.router, prefix="/api")
     app.include_router(execution.router, prefix="/api")
     app.include_router(verification.router, prefix="/api")
+    app.include_router(recovery.router, prefix="/api")
     app.include_router(docker.router, prefix="/api")
 
     @app.get("/", response_model=RootResponse, tags=["meta"])

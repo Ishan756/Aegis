@@ -39,8 +39,11 @@ from app.agents.debug_agent import DebugAssessment, assess_failure
 # from PLAN rather than loose state keys.
 from app.agents.deployment_verification import verify_deployment
 from app.agents.execution_engine import execute_stage
+from app.agents.recovery_workflow import run_recovery
 from app.models.docker import DockerDeployRequest
 from app.models.execution import Task
+from app.models.incident import IncidentReport
+from app.models.self_healing import RecoveryOutcome, SelfHealingPolicy
 from app.models.verification import VerificationRequest, VerificationResult
 
 logger = logging.getLogger(__name__)
@@ -79,6 +82,12 @@ class DeploymentWorkflowState(TypedDict, total=False):
     stopped: bool
     stop_reason: str | None
     stop_task_id: str | None
+
+    # Recovery
+    self_healing_policy: SelfHealingPolicy
+    self_healing_human_approved: bool
+    recovery: RecoveryOutcome
+    incident: IncidentReport | None
 
 
 def build_plan(request: DockerDeployRequest) -> list[Task]:
@@ -213,6 +222,96 @@ async def debug_stage(state: DeploymentWorkflowState) -> dict[str, Any]:
     return {"debug": assessment}
 
 
+async def recover_stage(state: DeploymentWorkflowState) -> dict[str, Any]:
+    """RECOVER: bounded automatic repair, when policy permits it.
+
+    A *separate* node after DEBUG rather than part of it, so the diagnosis is
+    produced whether or not acting on it is allowed. When self-healing is
+    disabled this still runs the investigation and returns immediately, which
+    keeps "diagnose" and "act" separable at the API surface too.
+    """
+    request: DockerDeployRequest = state["request"]
+    verification: VerificationResult | None = state.get("result")
+    policy: SelfHealingPolicy = state.get("self_healing_policy") or SelfHealingPolicy()
+
+    outcome = await run_recovery(
+        policy,
+        verification=verification,
+        stop_reason=state.get("stop_reason"),
+        stop_task_id=state.get("stop_task_id"),
+        container=request.container_name,
+        image=request.image,
+        repository_path=request.repository_path,
+        human_approved=bool(state.get("self_healing_human_approved")),
+        verify=_build_verifier(request),
+        redeploy=_build_redeployer(request),
+    )
+
+    logger.info(
+        "deployment workflow recovery finished",
+        extra={
+            "recovered": outcome.recovered,
+            "attempts_used": outcome.attempts_used,
+            "budget": outcome.budget,
+            "escalated": outcome.escalated,
+            "reason": str(outcome.escalation_reason) if outcome.escalation_reason else None,
+        },
+    )
+    return {"recovery": outcome, "recovered": outcome.recovered, "incident": outcome.incident}
+
+
+def _build_verifier(request: DockerDeployRequest) -> Any:
+    """A verifier bound to this request's container and port."""
+    from app.agents.deployment_verification import verify_deployment
+
+    async def verify() -> VerificationResult:
+        return await verify_deployment(
+            VerificationRequest(
+                container_name=request.container_name,
+                expected_port=expected_port(request),
+                health_path="/health",
+                log_tail=request.log_tail,
+            )
+        )
+
+    return verify
+
+
+def _build_redeployer(request: DockerDeployRequest) -> Any:
+    """Redeploy this request's container, without rebuilding the image.
+
+    Restart is the fix; rebuilding is a separate, riskier action that has to be
+    approved on its own. Recompiling the image here would quietly escalate a
+    restart into a rebuild.
+    """
+    from app.agents.execution_engine import execute_run
+    from app.models.execution import ExecutionRequest, Task
+
+    async def redeploy() -> Any:
+        return await execute_run(
+            ExecutionRequest(
+                tasks=[
+                    Task(
+                        id="redeploy",
+                        title=f"Restart {request.container_name}",
+                        tool="docker.start_container",
+                        arguments={
+                            "image": request.image,
+                            "name": request.container_name,
+                            "ports": list(request.ports),
+                        },
+                        requires_approval=True,
+                        timeout_seconds=180.0,
+                    )
+                ],
+                approve=True,
+                approval_reference="self-healing:restart",
+            )
+        )
+
+    return redeploy
+
+
 def route_after_verify(state: DeploymentWorkflowState) -> str:
     """Only a clean SUCCESS ends the run."""
     return "end" if state.get("status") == "SUCCESS" else "debug"
@@ -225,6 +324,7 @@ def build_workflow_graph() -> CompiledStateGraph:
     builder.add_node("execute", execute_stage)
     builder.add_node("verify", verify_stage)
     builder.add_node("debug", debug_stage)
+    builder.add_node("recover", recover_stage)
 
     builder.add_edge(START, "plan")
     builder.add_edge("plan", "execute")
@@ -232,7 +332,8 @@ def build_workflow_graph() -> CompiledStateGraph:
         "execute", route_after_execute, {"verify": "verify", "debug": "debug", "end": END}
     )
     builder.add_conditional_edges("verify", route_after_verify, {"end": END, "debug": "debug"})
-    builder.add_edge("debug", END)
+    builder.add_edge("debug", "recover")
+    builder.add_edge("recover", END)
 
     return builder.compile()
 
@@ -240,7 +341,12 @@ def build_workflow_graph() -> CompiledStateGraph:
 deployment_workflow_graph = build_workflow_graph()
 
 
-async def run_deployment_workflow(request: DockerDeployRequest) -> dict[str, Any]:
+async def run_deployment_workflow(
+    request: DockerDeployRequest,
+    *,
+    self_healing_policy: SelfHealingPolicy | None = None,
+    self_healing_human_approved: bool = False,
+) -> dict[str, Any]:
     """Run PLAN → EXECUTE → VERIFY → END for a local deployment.
 
     ``request.approve`` is threaded into the EXECUTE stage unchanged. The workflow
@@ -253,6 +359,8 @@ async def run_deployment_workflow(request: DockerDeployRequest) -> dict[str, Any
         "approval_reference": request.approval_reference,
         "stop_on_critical_failure": True,
         "dry_run": request.dry_run,
+        "self_healing_policy": self_healing_policy or SelfHealingPolicy(),
+        "self_healing_human_approved": self_healing_human_approved,
     }
     result = await deployment_workflow_graph.ainvoke(state)
     return {
@@ -260,6 +368,9 @@ async def run_deployment_workflow(request: DockerDeployRequest) -> dict[str, Any
         "execution": result.get("response"),
         "verification": result.get("result"),
         "debug": result.get("debug"),
+        "recovery": result.get("recovery"),
+        "recovered": bool(result.get("recovered")),
+        "incident": result.get("incident"),
         "plan_explanation": result.get("plan_explanation"),
         "stopped": bool(result.get("stopped")),
         "stop_reason": result.get("stop_reason"),

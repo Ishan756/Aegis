@@ -157,19 +157,36 @@ request cannot escape.
 - [ ] `mcp_servers/aws` — deploy, describe, logs, rollback
 - [ ] Credential handling and least-privilege roles
 
-## Stage 14 — Failure investigation ⬜
+## Stage 14 — Failure investigation ✅
 
-- [ ] Failure classification agent
+- [x] Failure classification agent (`app/agents/investigation.py`)
+- [x] Evidence-backed root causes — a cause with no citing observation is rejected
+- [x] Read-only evidence: container status/health/logs, HTTP probe, recent commits,
+      Dockerfile and repository configuration
+- [x] Confidence derived from independent corroboration, not asserted
+- [x] `POST /api/deployment/incident`, JSON or Markdown
 - [ ] Log correlation across services
 - [ ] Root-cause summary in the dashboard
 
-## Stage 15 — Safe self-healing ⬜
+## Stage 15 — Safe self-healing ✅
 
 - [x] Remediation proposals generated and never auto-applied; `applied` is always
       `false` and every proposal carries `requires_approval`
-- [ ] Human approval flow that can actually execute a proposal
-- [ ] Blast-radius checks before any destructive action
-- [ ] Full audit trail per remediation
+- [x] Human approval flow that can actually execute a proposal
+      (`human_approved` is a request field, never set by the graph)
+- [x] Blast-radius checks before any destructive action
+- [x] Full audit trail per remediation — applied *and* declined attempts
+- [x] Bounded loop: `max_recovery_attempts` (capped at 10), plus an independent
+      step limit so a routing bug cannot make it unbounded
+- [x] Non-destructive automatic actions only: retry, transient retry, restart
+- [x] Code and configuration changes are `FORBIDDEN` under every setting — there
+      is no flag that enables them
+- [x] Image rebuild is `APPROVAL_REQUIRED` and off by default, because it
+      re-executes untrusted Dockerfile `RUN` steps
+- [x] Disabled by default; a fresh install diagnoses and escalates
+- [ ] Restart reimplemented as a single non-destructive tool, so it does not
+      route through the high-risk `docker.stop_container`
+- [ ] Kubernetes rollout equivalents for each fix category
 
 ## Stage 16 — Dashboard maturity ⬜
 
@@ -192,5 +209,6 @@ request cannot escape.
 ## Explicitly out of scope until the stages above
 
 AWS integration · registry push · write-capable GitHub tools · autonomous
-deployment · self-healing. The packages that will hold them exist and are
-documented, but contain no implementation.
+deployment. Self-healing exists but is bounded, off by default, and cannot edit
+code or configuration; the Kubernetes equivalents of these fix categories are not
+built.
