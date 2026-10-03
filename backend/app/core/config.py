@@ -71,6 +71,45 @@ class GitHubSettings(_Section):
         return self.token is not None
 
 
+class DockerSettings(_Section):
+    """Docker deployment configuration.
+
+    The backend holds no Docker client. These values describe what the deployment
+    workflow is *allowed* to do; the ``docker`` MCP server enforces the same limits
+    independently, because a server is reachable from any MCP client, not just
+    this one.
+
+    :attr:`context_root` is the security boundary for builds: a build context
+    outside it is refused, so a crafted path cannot turn the host filesystem into
+    an image layer. It defaults to the repository root rather than the filesystem
+    root.
+    """
+
+    binary: str = Field(
+        default="docker",
+        description="Docker CLI executable name or absolute path, resolved via PATH.",
+    )
+    context_root: Path = Field(
+        default_factory=lambda: Path.cwd(),
+        description="Build contexts must resolve inside this directory.",
+    )
+    command_timeout_seconds: float = Field(default=30.0, gt=0, le=600.0)
+    build_timeout_seconds: float = Field(default=600.0, gt=0, le=3600.0)
+    max_output_bytes: int = Field(
+        default=64_000,
+        gt=0,
+        le=1_000_000,
+        description="Cap on captured stdout/stderr per command, per stream.",
+    )
+    max_log_lines: int = Field(default=200, gt=0, le=2000)
+    max_log_bytes: int = Field(default=32_000, gt=0, le=500_000)
+
+    @property
+    def context_root_resolved(self) -> Path:
+        """Absolute, symlink-resolved form of :attr:`context_root`."""
+        return self.context_root.expanduser().resolve()
+
+
 class MCPSettings(_Section):
     """MCP client configuration. No servers are registered yet."""
 
@@ -231,6 +270,7 @@ class Settings(BaseSettings):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     github: GitHubSettings = Field(default_factory=GitHubSettings)
     mcp: MCPSettings = Field(default_factory=MCPSettings)
+    docker: DockerSettings = Field(default_factory=DockerSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     aws: AWSSettings = Field(default_factory=AWSSettings)
@@ -282,6 +322,8 @@ class Settings(BaseSettings):
             # Not a secret, and the single most useful thing to know when
             # diagnosing an "outside the allowed root" rejection.
             "repository_root": str(self.repository_root_resolved),
+            # Not secret, and decisive for whether a build can even be attempted.
+            "docker_context_root": str(self.docker.context_root_resolved),
             "configured_integrations": self.configured_integrations(),
         }
 

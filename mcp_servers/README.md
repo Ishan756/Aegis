@@ -12,6 +12,7 @@ standalone process exposing a narrow set of audited tools; the backend's
 | ------------- | ---------------------------------------------------- | ------- |
 | `demo_server.py` | `get_system_info`, `get_project_files`, `get_project_status` | Shipped |
 | `github/`     | `get_repository`, `list_branches`, `list_commits`, `list_issues`, `list_pull_requests`, `list_files`, `get_file_contents` | Shipped (read-only) |
+| `docker/`     | `docker_available`, `list_images`, `build_image`, `start_container`, `stop_container`, `container_status`, `container_health`, `container_logs` | Shipped (writes locally) |
 | `docker/`     | build image, push image, inspect container, read logs       | Stage 10 |
 | `kubernetes/` | apply manifest, rollout status, pod logs                    | Stage 12 |
 | `aws/`        | describe instances, deploy, tail logs, rollback             | Stage 13 |
@@ -67,6 +68,52 @@ The backend reaches GitHub only by asking for a tool by name. Its workflow modul
 makes no HTTP request and never reads or stores a credential, so there is nowhere
 for the token to leak on that side either. (Settings do hold an `api_url` and the
 token, as `SecretStr`, because that is what gets forwarded to this server.)
+
+### The Docker server
+
+`docker/server.py` exposes eight tools over the Docker CLI. Five are read-only
+and run unattended; two change local state and need approval; one is destructive.
+
+| Tool                | Risk   | Approval | Why |
+| ------------------- | ------ | -------- | --- |
+| `docker_available`  | low    | no       | Reports CLI, daemon, version, context root |
+| `list_images`       | low    | no       | Local images with id, tag, size |
+| `container_status`  | low    | no       | Status, exit code, restart count, health |
+| `container_health`  | low    | no       | Health check status, last output, failing streak |
+| `container_logs`    | low    | no       | Capped tail of stdout and stderr |
+| `build_image`       | medium | **yes**  | Executes the Dockerfile's `RUN` steps |
+| `start_container`   | medium | **yes**  | Starts a container on the host |
+| `stop_container`    | high   | **yes**  | Terminates a running workload |
+
+How it avoids being a shell:
+
+- **Argument lists, `shell=False`, always.** There is no tool that takes a
+  command string, and `start_container` appends the image *last* with no
+  parameter after it, so `sh -c ...` cannot be smuggled in as an override.
+- **Names cannot become flags.** An image or container name starting with `-` is
+  rejected. Values reach `argv`, where Docker would otherwise read `--privileged`
+  as an option.
+- **Build contexts are confined** to `AEGIS_DOCKER__CONTEXT_ROOT`, resolved
+  *before* the containment check so a symlink cannot escape it.
+- **No health command.** `--health-cmd` would be execution inside a container, so
+  the capability is absent rather than restricted. Health comes from the image's
+  own `HEALTHCHECK`, and an image without one reports `no_healthcheck` — never
+  `healthy`.
+- **The child environment is an allowlist.** Only `PATH`, `HOME`, the Docker
+  connection variables and `AEGIS_DOCKER__*` are inherited, so a build step
+  cannot read the backend's LLM or GitHub credentials out of the environment.
+- **Bounded capture.** Output is read incrementally and capped; a timed-out
+  command has its entire process group killed, so it cannot wedge the server.
+- **Logs are capped** in lines and bytes, with `truncated` set so the model knows
+  it is reading a fragment. The *tail* is kept, because that is where a crash is.
+
+### Tool naming vs. the policy
+
+The container tool is `start_container`, not `run_container`. Aegis' policy
+refuses any tool whose name matches its command-execution pattern, so
+`run_container` would be rejected before it ever ran. Rather than carve out an
+exception and weaken the guarantee that no tool name can grant shell execution,
+the obvious name was given up. A test asserts the refusal still holds.
 
 ## Running a server
 
