@@ -7,15 +7,18 @@ plan, deploys it through audited MCP tools, verifies the result, and investigate
 failures — escalating to a human before it does anything destructive.
 
 > **Status: Stage 5 of 18 — MCP client layer.**
-> Four LangGraph workflows are live. The planning agent turns a natural-language
+> Six LangGraph workflows are live. The planning agent turns a natural-language
 > DevOps request into a structured execution plan via `POST /api/agent/plan`, the
 > repository analyzer profiles a **local** repository via
 > `POST /api/repository/analyze`, the MCP layer discovers and invokes tools on
 > configured servers via `GET /api/mcp/tools` and `POST /api/mcp/tools/call`, and
-> `POST /api/github/repository/analyze` profiles a **GitHub** repository and scores
-> its deployment readiness. All of it is read-only: no code is executed, no commit,
-> branch or pull request is created, and every tool call passes a deny-by-default
-> policy. See [`docs/roadmap.md`](docs/roadmap.md) for what comes next.
+> > `POST /api/github/repository/analyze` profiles a **GitHub** repository and scores
+> its deployment readiness, and `POST /api/docker/deploy` builds, runs, health-checks
+> and logs a container on the **local** Docker daemon. The read-only paths execute
+> nothing; the Docker path changes only the local daemon, and every build and run
+> requires explicit human approval through a deny-by-default policy. Nothing is
+> pushed to a registry and nothing reaches AWS. See
+> [`docs/roadmap.md`](docs/roadmap.md) for what comes next.
 
 ## Stack
 
@@ -111,6 +114,8 @@ aegis/
 | `GET`   | `/api/mcp/tools`      | List tools from MCP servers          |
 | `POST`  | `/api/mcp/tools/call` | Invoke one MCP tool                  |
 | `POST`  | `/api/github/repository/analyze` | Profile a GitHub repository and assess deployment readiness |
+| `POST`  | `/api/docker/deploy` | Build, run, health-check and log a container locally |
+| `POST`  | `/api/deployment/plan` | Turn a GitHub repository into an ordered deployment plan |
 | `GET`   | `/health`             | Unversioned alias for containers |
 | `GET`   | `/docs`               | OpenAPI / Swagger UI             |
 
@@ -417,6 +422,122 @@ languages. `ready` is true only when there are no blockers, so a high score with
 blocker still reports not ready.
 
 The score is a heuristic and says so in `readiness.notes`.
+
+### Docker
+
+`mcp_servers/docker/server.py` exposes eight tools over the Docker CLI: availability,
+image listing, build, start, stop, status, health and logs. Five are read-only. Two
+change local state and one is destructive, and all three require approval.
+
+```bash
+# backend/.env
+AEGIS_MCP__SERVERS=docker=python ../mcp_servers/docker/server.py
+AEGIS_MCP__FORWARD_ENVIRONMENT=AEGIS_DOCKER__CONTEXT_ROOT
+AEGIS_DOCKER__CONTEXT_ROOT=../examples
+```
+
+The container tool is named `start_container`, not `run_container`. Aegis' policy
+refuses any tool whose name matches its command-execution pattern, so
+`run_container` would be rejected outright. Rather than add an exception and weaken
+the guarantee that no tool name can ever grant shell execution, the more obvious
+name was given up. A test asserts the refusal still holds, so the reasoning cannot
+rot.
+
+#### What the Docker server deliberately cannot do
+
+| Capability | Why not |
+| ---------- | ------- |
+| Run a command in a container | `start_container` appends the image last and exposes no trailing argument, so an entrypoint cannot be overridden. That is what keeps `docker run IMAGE sh -c ...` unreachable. |
+| Set a health command | `--health-cmd` is execution inside a container. Health comes from the image's own `HEALTHCHECK`; an image with none reports `no_healthcheck`, never `healthy`. |
+| Mount a volume or pass env | Both are ways to hand a container the host's filesystem or credentials. The tests whitelist the entire parameter surface, so adding one fails the build rather than shipping. |
+| Pass build args | A build argument is a reliable way to bake a secret into an image layer. |
+| Pass environment variables to the build | The child's environment is an allowlist — `PATH`, `HOME`, Docker connection settings and `AEGIS_DOCKER__*` only. A Dockerfile's `RUN` step cannot read the backend's LLM or GitHub credentials. |
+
+Beyond that: names starting with `-` are rejected so they cannot be read as Docker
+flags; build contexts are confined to `context_root` with symlinks resolved *before*
+the containment check; output is read incrementally and capped; a timed-out command
+has its whole process group killed; and logs are capped in lines and bytes with
+`truncated` reported.
+
+#### Deploying the sample application
+
+`examples/sample_app` is a dependency-free HTTP service with a `HEALTHCHECK`, used by
+the integration tests against a real daemon:
+
+```bash
+curl -s localhost:8000/api/docker/deploy \
+  -H 'content-type: application/json' \
+  -d '{"repository_path":"../examples/sample_app","image":"aegis-sample:dev",
+       "container_name":"aegis-sample","ports":["8080:8000"],
+       "approve":true,"approval_reference":"your-name"}' | jq
+```
+
+```
+START → inspect_repository → build_image → start_container → check_health → collect_logs → END
+```
+
+`succeeded` is true only when the container started **and** reported healthy, so a
+container that is merely running is not reported as a working deployment. Without
+`approve: true` the build and run stages are refused and say so, rather than being
+quietly skipped. Use `dry_run: true` to inspect without building anything.
+
+### Deployment planning
+
+`POST /api/deployment/plan` turns a GitHub repository into an ordered deployment
+plan. It combines three things that are usually three separate agents and three
+inconsistent answers:
+
+| Phase | What it produces |
+| ----- | ---------------- |
+| Repository analysis | Stack, tests, Dockerfile, env templates, readiness |
+| DevOps planning | Build, test, deployment, health-check and rollback strategies |
+| Risk assessment | Risks, approval requirements, blocked steps |
+
+```bash
+curl -s 'localhost:8000/api/deployment/plan?format=markdown' \
+  -H 'content-type: application/json' \
+  -d '{"owner":"expressjs","repository":"express"}' | less
+```
+
+The response carries **both** representations: a machine-readable `plan` object and
+a `summary_markdown` rendering, produced from the same fields so they cannot
+disagree. Add `?format=markdown` to get the rendered form alone as `text/plain`.
+
+#### Decisions come from the profile
+
+| Condition | Decision |
+| --------- | -------- |
+| Dockerfile present | Build and deploy via Docker |
+| No Dockerfile | Recommend generating one — **never modify the repository** |
+| Tests present | Run the suite as a blocking gate |
+| No tests | Testing marked *limited*, never as a pass |
+| Required env var unresolved | Deployment **blocked** until resolved |
+
+Two of these are worth stating plainly, because both are places where a planner
+could quietly produce a confident wrong answer:
+
+**A missing Dockerfile produces a recommendation, not an edit.** The plan says
+which Dockerfile to add and why. Writing one is a separate, reviewed action — a
+planner that mutates the repository cannot be inspected before it changes anything.
+
+**A placeholder is not a value.** `.env.example` ships with `changeme` and
+`your-key-here`, and those are treated as *unresolved*, which blocks the
+deployment:
+
+```
+DATABASE_URL=changeme          -> unresolved (placeholder) -> blocks
+PORT=3000                      -> resolved
+DEBUG=                         -> unresolved (empty)       -> blocks
+```
+
+Resolved values are never echoed back. A plan reports *that* a variable is
+satisfied and *where* it was declared, never its contents.
+
+#### Blocking is contagious
+
+If the build is blocked because there is no Dockerfile, the test step that needs
+the image and the run step that needs the image are blocked too — each with its
+own reason. Marking only the first step would invite someone to skip ahead.
 
 ### Adding a server
 

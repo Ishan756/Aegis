@@ -8,9 +8,9 @@ FastAPI service that hosts Aegis' HTTP API and the LangGraph agent runtime.
 | --------------------- | --------------------------------------------------------- |
 | `app/main.py`         | Application factory, middleware, lifespan                 |
 | `app/api/`            | Routers, error handlers, FastAPI dependencies             |
-| `app/api/routes/`     | One module per API area (`health`, `agent`, `mcp`, `github`) |
+| `app/api/routes/`     | One module per API area (`health`, `agent`, `mcp`, `github`, `docker`) |
 | `app/core/`           | Settings, logging, request middleware, exception types    |
-| `app/models/`         | Pydantic contracts (`health`, `errors`, `planning`, `mcp`, `github`, `repository`) |
+| `app/models/`         | Pydantic contracts (`health`, `errors`, `planning`, `mcp`, `github`, `docker`, `repository`) |
 | `app/services/`       | Business logic, including the LLM provider interface      |
 | `app/agents/`         | LangGraph state graphs                                    |
 | `tests/`              | Unit and API tests                                        |
@@ -27,6 +27,8 @@ FastAPI service that hosts Aegis' HTTP API and the LangGraph agent runtime.
 | `GET`  | `/api/mcp/tools`          | List tools from MCP servers      |
 | `POST` | `/api/mcp/tools/call`     | Invoke one MCP tool              |
 | `POST` | `/api/github/repository/analyze` | Profile a GitHub repository and score deployment readiness |
+| `GET`  | `/api/docker/availability`  | Report whether the Docker daemon is reachable |
+| `POST` | `/api/docker/deploy`        | Build, run, health-check and log a local container |
 
 Health routes are versioned under `/api/v1`; the agent routes are intentionally
 unversioned because the response shapes are still pre-1.0.
@@ -184,6 +186,35 @@ Two deliberate choices are worth preserving:
 Readiness is scored in `assess_readiness` from profile facts, and every check that
 contributes a penalty names itself in `readiness.checks` so the number can be
 argued with.
+
+## Docker deployment
+
+`app/agents/docker_deployment.py` runs a repository through the local daemon:
+
+```
+START → inspect_repository → build_image → start_container → check_health → collect_logs → END
+```
+
+No module in `app/` shells out to Docker, and none builds a command line. Every
+stage asks the MCP layer for a tool by name, so it inherits the policy, approval
+gate and timeouts for free — which is why `build_image` and `start_container` are
+medium risk and gated behind `approve: true` plus an `approval_reference`.
+
+Three behaviours are deliberate and worth preserving:
+
+- **The workflow never approves itself.** `approval_granted` comes from the
+  caller's request and nowhere else, so an agent cannot set the flag on its own
+  request object and walk past the gate.
+- **A refusal is reported, not skipped.** An unapproved deploy returns 200 with
+  a `refused` step and a note saying how to proceed, rather than pretending the
+  stage did not exist.
+- **Success means started *and* healthy.** `succeeded` requires both, and an
+  image with no `HEALTHCHECK` is never counted as healthy. A build failure
+  short-circuits the remaining stages, recorded as `skipped`, so a deployment
+  that never started cannot report itself healthy with no logs.
+
+`dry_run: true` inspects and reports the plan without building or running
+anything.
 
 ## Local development
 

@@ -88,10 +88,25 @@ request cannot escape.
 - [x] GitHub repository analysis workflow with a scored deployment-readiness
       assessment (`POST /api/github/repository/analyze`)
 
-## Stage 10 — MCP: Docker ⬜
+## Stage 10 — MCP: Docker ◔
 
-- [ ] `mcp_servers/docker` — build, push, inspect, logs
-- [ ] Image build from a generated plan
+- [x] `mcp_servers/docker` — availability, build, images, start, stop, status,
+      health, logs (no shell, no push, no registry credentials)
+- [x] Docker deployment workflow: inspect → build → run → health check → logs
+- [x] Non-shell container start (no entrypoint override, no `--health-cmd`)
+- [ ] Image build driven by a generated plan
+
+## Stage 10b — Unified deployment planning ✅
+
+- [x] `RepositoryDeploymentPlan`: stack, five strategies, env vars, services, risks,
+      approvals, ordered steps
+- [x] One graph combining repository analysis, DevOps planning and risk assessment
+- [x] Dockerfile → Docker build; no Dockerfile → recommend one, never write it
+- [x] Tests present → run as a gate; absent → marked limited, never a pass
+- [x] Placeholder env values block the deployment until resolved
+- [x] Blocking propagates: no build means no image, so dependent steps are blocked too
+- [x] Machine-readable plan plus a Markdown rendering of the same fields
+- [ ] Executor that consumes a plan — deliberately separate from planning
 
 ## Stage 11 — Real deployment flow ⬜
 
@@ -140,6 +155,6 @@ request cannot escape.
 
 ## Explicitly out of scope until the stages above
 
-AWS integration · write-capable GitHub tools · autonomous
+AWS integration · registry push · write-capable GitHub tools · autonomous
 deployment · self-healing. The packages that will hold them exist and are
 documented, but contain no implementation.
