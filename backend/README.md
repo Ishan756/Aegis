@@ -8,9 +8,9 @@ FastAPI service that hosts Aegis' HTTP API and the LangGraph agent runtime.
 | --------------------- | --------------------------------------------------------- |
 | `app/main.py`         | Application factory, middleware, lifespan                 |
 | `app/api/`            | Routers, error handlers, FastAPI dependencies             |
-| `app/api/routes/`     | One module per API area (`health`, `agent`, `mcp`)        |
+| `app/api/routes/`     | One module per API area (`health`, `agent`, `mcp`, `github`) |
 | `app/core/`           | Settings, logging, request middleware, exception types    |
-| `app/models/`         | Pydantic contracts (`health`, `errors`, `planning`, `mcp`) |
+| `app/models/`         | Pydantic contracts (`health`, `errors`, `planning`, `mcp`, `github`, `repository`) |
 | `app/services/`       | Business logic, including the LLM provider interface      |
 | `app/agents/`         | LangGraph state graphs                                    |
 | `tests/`              | Unit and API tests                                        |
@@ -26,6 +26,7 @@ FastAPI service that hosts Aegis' HTTP API and the LangGraph agent runtime.
 | `POST` | `/api/repository/analyze` | Profile a local repository       |
 | `GET`  | `/api/mcp/tools`          | List tools from MCP servers      |
 | `POST` | `/api/mcp/tools/call`     | Invoke one MCP tool              |
+| `POST` | `/api/github/repository/analyze` | Profile a GitHub repository and score deployment readiness |
 
 Health routes are versioned under `/api/v1`; the agent routes are intentionally
 unversioned because the response shapes are still pre-1.0.
@@ -143,10 +144,46 @@ Two details worth keeping in mind when changing this code:
 ```bash
 AEGIS_MCP__ENABLED=true
 AEGIS_MCP__SERVERS=demo=python ../mcp_servers/demo_server.py
+AEGIS_MCP__FORWARD_ENVIRONMENT=AEGIS_GITHUB__TOKEN
 ```
 
 Commands are parsed with `shlex.split` and executed without a shell, so `sh`, `&&`
 and pipes are unavailable and quoting is required for paths containing spaces.
+
+`FORWARD_ENVIRONMENT` names the variables copied from the backend's environment into
+each subprocess, because the SDK otherwise inherits only `PATH`, `HOME` and similar.
+It is an allowlist of names, not a dump: a variable is forwarded only when listed,
+and only the names are ever logged. Keeping it explicit means adding a server to
+`servers` cannot silently grant it every secret the backend holds.
+
+## GitHub analysis
+
+`app/agents/github_repository_analysis.py` profiles a repository hosted on GitHub:
+
+```
+START → fetch_repository → inspect_files → detect_stack
+      → inspect_commits → inspect_issues → assess_readiness → END
+```
+
+No module in `app/` makes a GitHub HTTP request. Each node asks the MCP layer for
+a tool by name, so this is an ordinary consumer of the tool graph and inherits its
+policy, approval and timeout behaviour for free. The token is not read here either:
+it is held in settings as a `SecretStr` solely so it can be forwarded to the server.
+
+Two deliberate choices are worth preserving:
+
+- Stack detection is shared with the local analyzer. `detect_stack` only reads paths
+  and manifest text, so a synthetic `FileInventory` built from remote paths yields
+  the same profile. `extract_dependencies` is public for that reason — duplicating a
+  detector is how the two versions start disagreeing.
+- A failed optional read is a note, not an abort. If issues or commits cannot be
+  fetched, `profile.notes` records it and the profile is still returned. Likewise
+  `issues_inspected` distinguishes "not looked at" from "none open", so the field
+  never implies coverage that did not happen.
+
+Readiness is scored in `assess_readiness` from profile facts, and every check that
+contributes a penalty names itself in `readiness.checks` so the number can be
+argued with.
 
 ## Local development
 

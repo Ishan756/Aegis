@@ -83,6 +83,15 @@ class MCPSettings(_Section):
     #   AEGIS_MCP__SERVERS=github=python -m mcp_servers.github,docker=docker-mcp
     servers: Annotated[dict[str, str], NoDecode] = Field(default_factory=dict)
 
+    # Names of environment variables to forward into each MCP server process.
+    #
+    # The MCP SDK deliberately inherits only a small allowlist (PATH, HOME and
+    # friends), so a server cannot read AEGIS_GITHUB__TOKEN unless it is named
+    # here. Forwarding is opt-in and explicit rather than "pass the whole
+    # environment", so adding a server cannot silently hand it every secret the
+    # backend holds. Values are never logged.
+    forward_environment: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
     @field_validator("servers", mode="before")
     @classmethod
     def _parse_servers(cls, value: object) -> object:
@@ -105,6 +114,14 @@ class MCPSettings(_Section):
                     raise ValueError(f"MCP server entry {pair!r} is missing a name or command")
                 servers[name] = command
             return servers
+        return value
+
+    @field_validator("forward_environment", mode="before")
+    @classmethod
+    def _split_forward_environment(cls, value: object) -> object:
+        """Accept a comma-separated string, which is friendlier in ``.env``."""
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
         return value
 
     @property

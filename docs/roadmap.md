@@ -83,7 +83,10 @@ request cannot escape.
 - [x] Safe demo server (`mcp_servers/demo_server.py`) for offline development
 - [x] Approval enforcement for mutating tools
 - [x] `GET /api/mcp/tools`, `POST /api/mcp/tools/call`
-- [ ] `mcp_servers/github` — read repo, list branches, read file
+- [x] `mcp_servers/github` — read-only: repo, branches, commits, issues, pull
+      requests, file tree, file contents
+- [x] GitHub repository analysis workflow with a scored deployment-readiness
+      assessment (`POST /api/github/repository/analyze`)
 
 ## Stage 10 — MCP: Docker ⬜
 
@@ -137,6 +140,6 @@ request cannot escape.
 
 ## Explicitly out of scope until the stages above
 
-AWS integration · GitHub credentials · real MCP servers · autonomous
+AWS integration · write-capable GitHub tools · autonomous
 deployment · self-healing. The packages that will hold them exist and are
 documented, but contain no implementation.

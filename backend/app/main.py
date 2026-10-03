@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.errors import register_exception_handlers
 from app.api.router import api_router
-from app.api.routes import agent, mcp, repository
+from app.api.routes import agent, github, mcp, repository
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestLoggingMiddleware
@@ -99,6 +99,7 @@ def create_app() -> FastAPI:
     app.include_router(agent.router, prefix="/api")
     app.include_router(repository.router, prefix="/api")
     app.include_router(mcp.router, prefix="/api")
+    app.include_router(github.router, prefix="/api")
 
     @app.get("/", response_model=RootResponse, tags=["meta"])
     def read_root() -> RootResponse:
