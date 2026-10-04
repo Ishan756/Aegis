@@ -28,7 +28,7 @@ failures — escalating to a human before it does anything destructive.
 | Backend    | Python 3.11+, FastAPI, Pydantic v2, Uvicorn         |
 | Agent core | LangGraph 1.x (optional `agent` extra)             |
 | Tooling    | Python MCP SDK (declared, not yet installed)        |
-| Storage    | PostgreSQL- and Redis-compatible design, both optional |
+| Storage    | PostgreSQL via asyncpg for deployment history (optional); in-memory by default |
 | Dev env    | Docker, Docker Compose                              |
 | Config     | Environment variables via `.env`                    |
 
@@ -657,6 +657,51 @@ so the trail stays useful:
 {"DATABASE_URL": "postgres://u:p@h:5432/db"} -> {"DATABASE_URL": "postgres://***redacted***@h:5432/db"}
 {"image": "aegis-sample:dev"}                -> {"image": "aegis-sample:dev"}
 ```
+
+### Deployment history
+
+Every workflow run is recorded, and the record is what the dashboard reads.
+
+`GET /api/deployments` lists runs newest-first — status, commit, image, and how
+many actions and failures each produced. `GET /api/deployments/{id}` returns the
+whole trace: the plan, every action, the verification, the failures from each
+stage, the recovery attempts, the investigation, and the lessons the run taught.
+Add `?format=markdown` when you want to paste it into a ticket.
+
+Failures from `PLAN`, `EXECUTE`, `VERIFY`, `INVESTIGATE` and `RECOVER` are
+flattened into one list so a trace reads top to bottom instead of by stage. A run
+is written twice — `in_progress` before the graph starts, then the final status —
+so a deployment that is killed mid-flight is still visible rather than absent.
+
+#### History is optional, not required
+
+With no `AEGIS_DATABASE__URL`, history is kept in-process: readable for the life
+of the server, gone on restart. Set the URL and it becomes durable:
+
+```bash
+pip install -e ".[storage]"          # asyncpg
+export AEGIS_DATABASE__URL=postgresql://aegis:aegis@localhost:5432/aegis
+```
+
+The schema is applied on startup and is idempotent, so an empty database is
+enough. Nested trace data is stored as JSONB; the fields you filter and sort on
+are indexed columns.
+
+A failed history write is logged and dropped. Losing a ledger entry is
+recoverable; refusing to deploy because the ledger is down is not.
+
+#### Lessons that accumulate
+
+A failed deployment produces lessons and a successful one produces none —
+storing successes as "lessons" would bury the ones that matter. A lesson's
+identity is a fingerprint of cause, repository and component rather than of the
+occurrence, so the second time a repository fails the same way it increments
+`occurrences` on one row instead of leaving near-duplicates behind.
+
+Relevance scoring lives behind a `LessonMatcher` interface. The implementation is
+deterministic keyword matching and needs no model or vector store, and the
+fingerprint is a stable string — so the same row can later carry a vector column
+without a single caller changing.
 
 ### Deployment planning
 

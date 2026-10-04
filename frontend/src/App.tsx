@@ -1,12 +1,16 @@
 import { BackendConnection } from './components/BackendConnection'
 import { ComponentList } from './components/ComponentList'
+import { DeploymentHistory } from './components/DeploymentHistory'
+import { DeploymentTrace } from './components/DeploymentTrace'
 import { SystemStatus } from './components/SystemStatus'
+import { useDeploymentHistory } from './hooks/useDeploymentHistory'
 import { useHealth } from './hooks/useHealth'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
 
 export default function App() {
   const { connection, health, error, latencyMs, lastChecked, refresh } = useHealth()
+  const history = useDeploymentHistory()
 
   return (
     <div className="app">
@@ -34,6 +38,35 @@ export default function App() {
         {health && health.components.length > 0 && (
           <div className="grid__full">
             <ComponentList components={health.components} />
+          </div>
+        )}
+
+        <div className="grid__full">
+          <DeploymentHistory
+            deployments={history.deployments}
+            total={history.total}
+            offset={history.offset}
+            loading={history.status === 'loading'}
+            error={history.error}
+            statusFilter={history.statusFilter}
+            onStatusFilter={history.setStatusFilter}
+            onSelect={history.select}
+            onPage={history.page}
+            onRetry={history.retry}
+          />
+        </div>
+
+        {history.selected && (
+          <div className="grid__full">
+            <DeploymentTrace detail={history.selected} onClose={() => history.select(null)} />
+          </div>
+        )}
+
+        {history.traceState === 'error' && history.traceError && (
+          <div className="grid__full">
+            <p className="note note--error" role="alert">
+              Could not load that deployment: {history.traceError}
+            </p>
           </div>
         )}
       </main>
