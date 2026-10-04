@@ -13,6 +13,7 @@ from app.api.router import api_router
 from app.api.routes import (
     agent,
     deployment,
+    deployments,
     docker,
     execution,
     github,
@@ -24,6 +25,12 @@ from app.api.routes import (
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestLoggingMiddleware
+from app.memory import (
+    DeploymentMemoryService,
+    InMemoryMemoryStore,
+    build_memory_service,
+    set_memory_service,
+)
 from app.models.health import RootResponse
 from app.services.mcp_manager import MCPClientManager, set_manager
 from app.services.status import StatusService
@@ -50,6 +57,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # connected, rather than only whether MCP was enabled.
     app.state.status_service = StatusService(settings, app)
 
+    # A database that is unreachable must not stop the service starting. History
+    # records what already happened; it is not a precondition for deploying, and a
+    # backend that refuses to boot because a ledger is down turns a history
+    # problem into an outage. Fall back to in-memory and say so loudly.
+    memory = build_memory_service(settings)
+    try:
+        await memory.start()
+    except Exception as exc:  # noqa: BLE001 - any failure falls back, none is fatal
+        logger.error(
+            "deployment memory unavailable; continuing without durable history",
+            extra={"error": str(exc)},
+        )
+        memory = DeploymentMemoryService(InMemoryMemoryStore())
+        await memory.start()
+    app.state.memory_service = memory
+    set_memory_service(memory)
+
     logger.info(
         "Aegis backend starting",
         # safe_summary() only reports whether credentials are present, never
@@ -62,6 +86,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        set_memory_service(None)
+        await memory.close()
         set_manager(None)
         await manager.close()
         logger.info("Aegis backend shutting down")
@@ -114,6 +140,7 @@ def create_app() -> FastAPI:
     app.include_router(execution.router, prefix="/api")
     app.include_router(verification.router, prefix="/api")
     app.include_router(recovery.router, prefix="/api")
+    app.include_router(deployments.router, prefix="/api")
     app.include_router(docker.router, prefix="/api")
 
     @app.get("/", response_model=RootResponse, tags=["meta"])

@@ -188,11 +188,29 @@ request cannot escape.
       route through the high-risk `docker.stop_container`
 - [ ] Kubernetes rollout equivalents for each fix category
 
+## Stage 15a — Deployment history ✅
+
+- [x] `DeploymentRecord`: repository, commit, plan, tasks, actions, verification,
+      per-stage failures, recovery attempts, incident, status and timestamps
+- [x] `MemoryStore` protocol with in-memory and PostgreSQL implementations, so
+      the API never learns which one it is talking to
+- [x] PostgreSQL JSONB for the nested trace, indexed columns for what is
+      filtered and sorted, upsert on `deployment_id`
+- [x] Lessons keyed on a stable fingerprint: the same cause in the same
+      repository increments one row instead of accumulating duplicates
+- [x] `GET /api/deployments` and `GET /api/deployments/{id}`, plus
+      `?format=markdown` for pasting into a ticket
+- [x] History survives a database outage: persistence is best-effort and a
+      failed write is logged, not raised
+- [x] Dashboard history list and execution-trace view
+- [ ] Lessons recalled automatically before a deployment runs
+- [ ] A migration runner, once the schema starts changing in the field
+
 ## Stage 16 — Dashboard maturity ⬜
 
-- [ ] Deployment timeline and live agent run view
+- [ ] Live agent run view (history is recorded, not streamed)
 - [ ] Approval UI
-- [ ] Failure and remediation history
+- [ ] Historical trend charts over the stored records
 
 ## Stage 17 — Evaluation ⬜
 

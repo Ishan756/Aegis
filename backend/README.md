@@ -35,6 +35,8 @@ FastAPI service that hosts Aegis' HTTP API and the LangGraph agent runtime.
 | `POST` | `/api/verification/deployment` | Verify a deployed container against seven checks |
 | `POST` | `/api/deployment/incident`   | Investigate a failure read-only and report an evidence-backed cause |
 | `POST` | `/api/deployment/recover`    | Attempt bounded, policy-gated automatic recovery |
+| `GET`  | `/api/deployments`           | List recorded deployment history |
+| `GET`  | `/api/deployments/{id}`      | One deployment's full execution trace |
 
 Health routes are versioned under `/api/v1`; the agent routes are intentionally
 unversioned because the response shapes are still pre-1.0.
@@ -333,6 +335,84 @@ Only a clean `SUCCESS` ends the run. A dry run ends without verifying anything,
 because nothing was deployed — running the verifier anyway would report on a
 container that does not exist, which is a false failure rather than a useful one.
 
+## Deployment history
+
+Every workflow run is recorded, and the record is the evidence the dashboard
+reads. It is written twice: `IN_PROGRESS` before the graph runs, then the final
+status with everything the run produced. A run that is killed mid-flight
+therefore stays visible as `in_progress` instead of vanishing from the ledger.
+
+### Storing a run
+
+`app/models/deployment_record.py` holds one `DeploymentRecord` per run: the
+repository and commit, the plan and executed tasks, every action, the
+verification result, the failures from each stage, the recovery attempts, the
+investigation, and the timings.
+
+Failures from `PLAN`, `EXECUTE`, `VERIFY`, `INVESTIGATE` and `RECOVER` are
+flattened into a single list so a trace reads top to bottom instead of by stage.
+
+### Two stores, one interface
+
+`app/memory/base.py` defines `MemoryStore`. Two implementations satisfy it:
+
+| | `InMemoryMemoryStore` | `PostgresMemoryStore` |
+|---|---|---|
+| Selected when | no `AEGIS_DATABASE__URL` | URL is set |
+| Survives a restart | no | yes |
+| Needs `asyncpg` | no | yes (`.[storage]`) |
+| Concurrent writers | single process | pooled, counters merged in SQL |
+
+Callers never branch on which one is active. The schema is applied on startup and
+is idempotent, so an empty database is enough; `memory_schema` records the
+version it was created at.
+
+Nested trace data is stored as JSONB and the fields that get filtered or sorted
+on are real columns with indexes. Rows are upserted on `deployment_id`, because a
+deployment is written again as each stage completes.
+
+### Lessons
+
+A failed deployment produces lessons; a successful one produces none. Identity is
+a **fingerprint** of cause, repository and component rather than of the
+occurrence, so the second time a repository fails the same way it increments
+`occurrences` on one row instead of creating a near-duplicate. `LessonMatcher` is
+the seam where relevance scoring lives; `KeywordLessonMatcher` is deterministic
+and needs no model, and the fingerprint is a stable string so the same row can
+later carry a vector column without any caller changing.
+
+### Failure is not fatal
+
+A history write that fails is logged and dropped. Losing a ledger entry is
+recoverable; refusing to deploy because a ledger is down is not. The one thing
+that propagates is `health()`, which reports an unreachable store rather than
+raising.
+
+### Reading history
+
+```
+GET /api/deployments?limit=20&offset=0&repository=acme/api&status=failed
+GET /api/deployments/{deployment_id}
+GET /api/deployments/{deployment_id}?format=markdown
+```
+
+List rows are summaries on purpose: a history list is read far more often than a
+history detail, and returning every plan and action log in every row would make
+the list expensive for data nobody looks at. `limit` is capped at 200.
+
+### Testing against both stores
+
+The store contract is exercised against both implementations by the same
+assertions — a mock only proves the code calls what the test already expected.
+Postgres tests skip unless a database is offered:
+
+```
+docker run -d --name aegis-pg-test -e POSTGRES_PASSWORD=testpw \
+  -e POSTGRES_USER=aegis -e POSTGRES_DB=aegis_test -p 55432:5432 postgres:16-alpine
+AEGIS_TEST_DATABASE_URL=postgresql://aegis:testpw@127.0.0.1:55432/aegis_test \
+  .venv/bin/python -m pytest tests/test_deployment_memory.py
+```
+
 ## Investigation and self-healing
 
 A failure routes to `DEBUG`, then to `RECOVER`. The two are separate nodes so the
@@ -439,6 +519,10 @@ ruff check .      # lint
 ruff format .     # format
 ```
 
+The history store tests run against every implementation, so they run without a
+database too — the Postgres half skips. To exercise it, point them at a
+database; see [Deployment history](#deployment-history).
+
 ## Notes
 
 - LangGraph and the MCP SDK are both required by the agent runtime and live in
@@ -449,6 +533,7 @@ ruff format .     # format
 - The MCP SDK exposes snake_case attributes (`is_error`, `read_only_hint`) for
   wire fields that are camelCase in the protocol. Code reading them checks both
   spellings.
-- PostgreSQL and Redis are not required. If `AEGIS_DATABASE_URL` is set the
-  health endpoint reports the database as configured, but no connection is
-  opened yet.
+- PostgreSQL is not required. Without `AEGIS_DATABASE__URL`, deployment history
+  is kept in-process: readable for the life of the server, gone on restart. With
+  it set, history is durable — install the `storage` extra for `asyncpg`.
+- Redis is not required, and no client is created yet.

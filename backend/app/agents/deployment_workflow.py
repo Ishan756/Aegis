@@ -40,6 +40,7 @@ from app.agents.debug_agent import DebugAssessment, assess_failure
 from app.agents.deployment_verification import verify_deployment
 from app.agents.execution_engine import execute_stage
 from app.agents.recovery_workflow import run_recovery
+from app.memory import get_memory_service
 from app.models.docker import DockerDeployRequest
 from app.models.execution import Task
 from app.models.incident import IncidentReport
@@ -353,6 +354,14 @@ async def run_deployment_workflow(
     never manufactures approval: a request without ``approve: true`` has its build
     and run refused, exactly as a direct deployment would.
     """
+    memory = get_memory_service()
+
+    # Recorded before the graph runs, so an interrupted or killed deployment still
+    # appears in history. Without this, "it vanished" and "it never ran" look the
+    # same from the history endpoint.
+    record = await memory.begin_deployment(request=request)
+    started_at = record.started_at
+
     state: DeploymentWorkflowState = {
         "request": request,
         "approve": request.approve,
@@ -362,8 +371,32 @@ async def run_deployment_workflow(
         "self_healing_policy": self_healing_policy or SelfHealingPolicy(),
         "self_healing_human_approved": self_healing_human_approved,
     }
-    result = await deployment_workflow_graph.ainvoke(state)
+
+    try:
+        result = await deployment_workflow_graph.ainvoke(state)
+    except BaseException:
+        # The graph raised. Left as in_progress rather than marked failed: the
+        # service does not know why it failed, and inventing a reason here would
+        # put a false conclusion in the record. An interrupted run reads as
+        # interrupted.
+        raise
+
+    await memory.record_deployment(
+        deployment_id=record.deployment_id,
+        request=request,
+        tasks=result.get("tasks"),
+        execution=result.get("response"),
+        verification=result.get("result"),
+        incident=result.get("incident"),
+        recovery=result.get("recovery"),
+        recovered=bool(result.get("recovered")),
+        stopped=bool(result.get("stopped")),
+        stop_reason=result.get("stop_reason"),
+        started_at=started_at,
+    )
+
     return {
+        "deployment_id": record.deployment_id,
         "plan": result.get("tasks", []),
         "execution": result.get("response"),
         "verification": result.get("result"),

@@ -28,6 +28,13 @@ agent = [
     "mcp>=2.0.0",
 ]
 
+# Durable deployment history. Optional because history degrades to an in-memory
+# store when it is absent: a missing database must cost you durability, not the
+# ability to deploy.
+storage = [
+    "asyncpg>=0.29.0",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
