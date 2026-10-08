@@ -52,11 +52,11 @@ import os
 import re
 import urllib.error
 import urllib.request
-import selectors
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -265,6 +265,12 @@ def _resolve_binary() -> str:
 _INHERITED_ENV = (
     "PATH",
     "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
     "USER",
     "LOGNAME",
     "TMPDIR",
@@ -307,6 +313,118 @@ class CommandResult:
     truncated: bool = False
 
 
+#: How much is read from a pipe per syscall. Large enough that a chatty build is
+#: not read in slivers, small enough that a partial read is cheap to discard.
+_READ_CHUNK = 65536
+
+#: How long a drained stream gets to finish after the child has been killed.
+#: A thread blocked in ``read1`` returns as soon as the child closes its end of
+#: the pipe, so this only has to cover scheduling latency.
+_DRAIN_GRACE_SECONDS = 5.0
+
+#: How long a signalled command gets to exit before it is killed outright.
+_TERMINATE_GRACE_SECONDS = 2.0
+
+
+class _OutputDrain:
+    """Drain a subprocess's stdout and stderr concurrently into bounded buffers.
+
+    One reader thread per pipe, each doing a blocking ``read1`` until EOF. Threads
+    rather than a readiness selector because Windows offers no way to wait on an
+    anonymous pipe: ``select()`` accepts only sockets there, and :mod:`selectors`
+    has no poll or epoll backend on that platform, so registering an anonymous
+    pipe raises ``OSError: [WinError 10038]``. Threads are the portable answer.
+
+    The property that matters is preserved: both pipes are drained at the same
+    time, so a child filling stderr cannot deadlock against a parent that is only
+    reading stdout. Output past ``limit`` is discarded rather than buffered, so a
+    chatty build cannot grow this process's memory.
+    """
+
+    def __init__(self, process: subprocess.Popen[bytes], *, limit: int) -> None:
+        self._limit = limit
+        self._buffers = {"stdout": bytearray(), "stderr": bytearray()}
+        self._kept = {"stdout": 0, "stderr": 0}
+        self._truncated = False
+
+        assert process.stdout is not None and process.stderr is not None
+        self._streams = {"stdout": process.stdout, "stderr": process.stderr}
+        self._threads = [
+            threading.Thread(
+                target=self._pump,
+                args=(name,),
+                # Daemon: a reader wedged behind a process that refused to die
+                # must never hold up interpreter shutdown.
+                daemon=True,
+                name=f"docker-mcp-{name}",
+            )
+            for name in ("stdout", "stderr")
+        ]
+
+    @property
+    def running(self) -> bool:
+        """True while either pipe has not yet reached EOF."""
+        return any(thread.is_alive() for thread in self._threads)
+
+    def start(self) -> None:
+        for thread in self._threads:
+            thread.start()
+
+    def join(self, timeout: float) -> None:
+        """Wait for the readers, bounded so a stuck pipe cannot hang the caller."""
+        for thread in self._threads:
+            thread.join(timeout=timeout)
+
+    def result(self) -> tuple[bytes, bytes, bool]:
+        """Whatever was collected: both streams and whether anything was dropped."""
+        return (
+            bytes(self._buffers["stdout"]),
+            bytes(self._buffers["stderr"]),
+            self._truncated,
+        )
+
+    def _pump(self, name: str) -> None:
+        stream = self._streams[name]
+        try:
+            while True:
+                # read1 returns whatever has arrived instead of blocking for a
+                # full buffer, so a slow trickle still makes progress.
+                chunk = stream.read1(_READ_CHUNK)
+                if not chunk:
+                    return
+                self._absorb(name, chunk)
+        except (OSError, ValueError):
+            # A closed pipe is how a killed child looks from this side. Whatever
+            # arrived before it closed is kept; there is nothing more to read.
+            return
+
+    def _absorb(self, name: str, chunk: bytes) -> None:
+        if self._kept[name] >= self._limit:
+            # Still draining so the child does not block on a full pipe, but no
+            # longer accumulating.
+            self._truncated = True
+            return
+        room = self._limit - self._kept[name]
+        kept = chunk[:room]
+        self._buffers[name].extend(kept)
+        self._kept[name] += len(kept)
+
+
+class _CaptureTimeout(TimeoutError):
+    """A command outlived its deadline. Carries what was read before it did.
+
+    A :class:`TimeoutError` so the existing ``except TimeoutError`` contract
+    holds, with the partial output attached because a hung build's last few
+    lines are frequently the only diagnostic it ever produces.
+    """
+
+    def __init__(self, stdout: bytes, stderr: bytes, truncated: bool) -> None:
+        super().__init__("subprocess output capture exceeded its deadline")
+        self.stdout = stdout
+        self.stderr = stderr
+        self.truncated = truncated
+
+
 def _capture(
     process: subprocess.Popen[bytes],
     *,
@@ -315,78 +433,119 @@ def _capture(
 ) -> tuple[bytes, bytes, bool]:
     """Read both pipes until EOF, the cap or the deadline.
 
-    Both streams are drained together with :mod:`selectors`, because reading one
-    to completion first would deadlock as soon as the child filled the other.
-    Output past ``limit`` is discarded rather than buffered, so a chatty build
-    cannot grow this process's memory.
+    Uses :class:`_OutputDrain` rather than :mod:`selectors` so the same code
+    works on Windows; see that class for why a selector cannot be used there.
     """
-    selector = selectors.DefaultSelector()
-    assert process.stdout is not None and process.stderr is not None
-    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
-
-    buffers: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
-    sizes = {"stdout": 0, "stderr": 0}
-    open_streams = 2
-    truncated = False
+    drain = _OutputDrain(process, limit=limit)
+    drain.start()
 
     try:
-        while open_streams:
+        while drain.running:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError
-
-            for key, _ in selector.select(timeout=min(remaining, 0.25)):
-                # read1 returns whatever has arrived instead of blocking for a
-                # full buffer, so a slow trickle still makes progress.
-                chunk = key.fileobj.read1(65536)  # type: ignore[union-attr]
-                name = key.data
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    open_streams -= 1
-                    continue
-                if sizes[name] < limit:
-                    room = limit - sizes[name]
-                    kept = chunk[:room]
-                    buffers[name].extend(kept)
-                    sizes[name] += len(kept)
-                else:
-                    # Still draining so the child does not block on a full pipe,
-                    # but no longer accumulating.
-                    truncated = True
+                # Kill before joining. A reader blocked in read1 only returns when
+                # the child closes its end of the pipe, so joining a live process
+                # would wait forever; killing turns that block into EOF.
+                _kill_tree(process)
+                drain.join(_DRAIN_GRACE_SECONDS)
+                raise _CaptureTimeout(*drain.result())
+            # Bounded so the deadline is honoured promptly rather than at the next
+            # natural EOF.
+            drain.join(min(remaining, 0.25))
     finally:
-        selector.close()
+        drain.join(_DRAIN_GRACE_SECONDS)
 
-    return bytes(buffers["stdout"]), bytes(buffers["stderr"]), truncated
+    return drain.result()
 
 
-def _kill_tree(process: subprocess.Popen[bytes]) -> None:
-    """Kill the command and anything it started.
+def _taskkill(process: subprocess.Popen[bytes], *, force: bool) -> bool:
+    """Stop a process tree on Windows. True when the tree was actually signalled."""
+    argv = ["taskkill", "/T", "/PID", str(process.pid)]
+    if force:
+        argv.insert(1, "/F")
+    try:
+        completed = subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            timeout=_TERMINATE_GRACE_SECONDS * 5,
+            # Without this a console application flashes a window on a
+            # developer's desktop every time a build times out.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
 
-    The child leads its own session, so the process *group* can be signalled and
-    Docker's own helpers do not survive as orphans.
-    """
+
+def _terminate_tree(process: subprocess.Popen[bytes]) -> None:
+    """Ask the command and everything it started to stop, politely."""
+    if sys.platform == "win32":
+        # Windows has no equivalent of killpg. A child created in its own process
+        # group can only be asked to stop through a console control event, and the
+        # Docker CLI has no console of its own to receive one. taskkill /T walks
+        # the parent/child tree in the kernel instead, so Docker's own helper
+        # processes do not survive as orphans either.
+        if not _taskkill(process, force=False):
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        return
+
     try:
         os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
+    except (AttributeError, ProcessLookupError, PermissionError, OSError):
+        # AttributeError: no killpg/getpgid at all. Falling back to the direct
+        # child is worse than a group signal but better than leaking the process.
         try:
             process.terminate()
         except OSError:
             pass
 
-    try:
-        process.wait(timeout=2)
+
+def _kill_tree_forcibly(process: subprocess.Popen[bytes]) -> None:
+    """Stop the tree with no chance to clean up."""
+    if sys.platform == "win32":
+        if not _taskkill(process, force=True):
+            try:
+                process.kill()
+            except OSError:
+                pass
         return
-    except subprocess.TimeoutExpired:
-        pass
 
     try:
         os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
+    except (AttributeError, ProcessLookupError, PermissionError, OSError):
         try:
             process.kill()
         except OSError:
             pass
+
+
+def _kill_tree(process: subprocess.Popen[bytes]) -> None:
+    """Kill the command and anything it started.
+
+    On POSIX the child leads its own session, so the process *group* can be
+    signalled. On Windows there is no such signal and the tree is walked instead.
+    Both paths escalate rather than settle: polite first, then forceful, and the
+    direct child is always signalled too, because it is the process whose exit
+    status the caller reads and a tree sweep that misses it would leave a zombie.
+    """
+    _terminate_tree(process)
+
+    try:
+        process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    _kill_tree_forcibly(process)
+
+    try:
+        process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:  # pragma: no cover - the OS has refused
+        pass
 
 
 def _run(
@@ -429,15 +588,16 @@ def _run(
     timed_out = False
     try:
         stdout, stderr, truncated = _capture(process, limit=cap, deadline=deadline)
-    except TimeoutError:
+    except TimeoutError as exc:
         timed_out = True
         _kill_tree(process)
-        # Drain whatever is buffered so the pipes do not stay open, but do not
-        # wait long: the process has already been killed.
-        try:
-            stdout, stderr = process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:  # pragma: no cover - defensive
-            stdout, stderr = b"", b""
+        # Whatever was read before the deadline is the only diagnostic a hung
+        # command ever produces, so it is kept. A capture replaced by a test
+        # double may carry nothing, hence the empty fallback. Notably this does
+        # not call communicate(): the reader threads own these pipes, and a
+        # second reader would race them for the same bytes.
+        stdout = getattr(exc, "stdout", b"") or b""
+        stderr = getattr(exc, "stderr", b"") or b""
         truncated = True
     else:
         try:

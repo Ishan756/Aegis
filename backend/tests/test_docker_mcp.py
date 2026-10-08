@@ -18,6 +18,7 @@ grown a capability nobody intended.
 from __future__ import annotations
 
 import importlib.util
+import os
 import shutil
 import subprocess
 import sys
@@ -463,6 +464,176 @@ class TestOutputLimits:
 
     def test_empty_text_is_handled(self, docker_server: Any) -> None:
         assert docker_server._tail("", max_lines=10, max_bytes=100) == ("", False)
+
+
+class TestSubprocessCapture:
+    """The real capture and termination paths, on whatever platform runs them.
+
+    The timeout tests below replace ``_capture`` with a double, which proves the
+    caller's error handling but says nothing about capture itself. These drive
+    actual child processes, because the mechanism they cover is the one that had
+    to change for Windows: a selector cannot wait on an anonymous pipe there, and
+    ``killpg`` does not exist.
+    """
+
+    @staticmethod
+    def _child(source: str) -> subprocess.Popen[bytes]:
+        """A child process with both pipes open, started detached like the real one."""
+        return subprocess.Popen(
+            [sys.executable, "-c", source],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            start_new_session=True,
+        )
+
+    def test_both_streams_are_captured(self, docker_server: Any) -> None:
+        process = self._child("import sys; sys.stdout.write('on-out'); sys.stderr.write('on-err')")
+
+        stdout, stderr, truncated = docker_server._capture(
+            process, limit=100_000, deadline=time.monotonic() + 30
+        )
+
+        assert stdout == b"on-out"
+        assert stderr == b"on-err"
+        assert truncated is False
+
+    def test_a_child_filling_one_pipe_does_not_deadlock(self, docker_server: Any) -> None:
+        """Both pipes must be drained at once.
+
+        More than a pipe buffer on stderr would block the child forever if the
+        parent were reading stdout to EOF first — which is exactly the deadlock a
+        single-threaded, single-stream read would reintroduce.
+        """
+        megabyte = b"e" * (1024 * 1024)
+        process = self._child(
+            "import sys; sys.stderr.buffer.write(b'e' * (1024 * 1024)); "
+            "sys.stderr.buffer.flush(); sys.stdout.buffer.write(b'done')"
+        )
+
+        stdout, stderr, _ = docker_server._capture(
+            process, limit=4 * 1024 * 1024, deadline=time.monotonic() + 30
+        )
+
+        assert stdout == b"done", "stdout was starved while stderr filled"
+        assert len(stderr) == len(megabyte)
+
+    def test_the_byte_cap_is_enforced(self, docker_server: Any) -> None:
+        process = self._child("import sys; sys.stdout.write('x' * 5000)")
+
+        stdout, _, _ = docker_server._capture(process, limit=100, deadline=time.monotonic() + 30)
+
+        assert len(stdout) == 100
+
+    def test_overflow_is_reported_as_truncated(self, docker_server: Any) -> None:
+        """Dropped output must show up in the flag, not just be silently shorter.
+
+        Written in pieces so the overflow arrives in its own read, which is the
+        case the flag covers.
+        """
+        process = self._child(
+            "import sys\n"
+            "for _ in range(50):\n"
+            "    sys.stdout.write('y' * 100)\n"
+            "    sys.stdout.flush()\n"
+        )
+
+        stdout, _, truncated = docker_server._capture(
+            process, limit=100, deadline=time.monotonic() + 30
+        )
+
+        assert len(stdout) == 100
+        assert truncated is True
+
+    def test_output_under_the_cap_is_not_flagged(self, docker_server: Any) -> None:
+        process = self._child("import sys; sys.stdout.write('small')")
+
+        stdout, _, truncated = docker_server._capture(
+            process, limit=100_000, deadline=time.monotonic() + 30
+        )
+
+        assert stdout == b"small"
+        assert truncated is False
+
+    def test_a_hanging_child_raises_at_the_deadline(self, docker_server: Any) -> None:
+        process = self._child("import time; time.sleep(60)")
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            docker_server._capture(process, limit=1000, deadline=time.monotonic() + 0.5)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 15, "the deadline was not honoured"
+
+    def test_a_timeout_carries_what_was_already_read(self, docker_server: Any) -> None:
+        """A hung build's last output is frequently its only diagnostic."""
+        process = self._child(
+            "import sys, time; sys.stdout.write('step one\\n'); sys.stdout.flush(); time.sleep(60)"
+        )
+
+        with pytest.raises(TimeoutError) as caught:
+            docker_server._capture(process, limit=1000, deadline=time.monotonic() + 1.0)
+
+        assert b"step one" in caught.value.stdout
+
+    def test_capture_leaves_no_running_child(self, docker_server: Any) -> None:
+        """The readers must not keep a timed-out process alive."""
+        process = self._child("import time; time.sleep(60)")
+
+        with pytest.raises(TimeoutError):
+            docker_server._capture(process, limit=1000, deadline=time.monotonic() + 0.5)
+
+        # _capture kills at the deadline, so the child is already gone.
+        assert process.wait(timeout=15) is not None
+
+    def test_killing_a_tree_stops_the_children_too(self, docker_server: Any) -> None:
+        """A surviving grandchild is how a timed-out build keeps holding a port.
+
+        Signalling only the direct child would satisfy every other test in this
+        file while leaving Docker's helper processes running.
+        """
+        process = self._child(
+            "import subprocess, sys, time; "
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            "sys.stdout.write(str(child.pid)); sys.stdout.flush(); time.sleep(60)"
+        )
+
+        # Read the grandchild's pid straight from the pipe, so the assertion is
+        # about the process that was actually created.
+        grandchild_pid = int(process.stdout.readline().decode().strip())
+
+        docker_server._kill_tree(process)
+
+        assert process.poll() is not None, "the command survived"
+        assert not self._alive(grandchild_pid), "a grandchild survived the tree kill"
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        """Whether a pid is still running, checked the way each platform allows."""
+        if sys.platform == "win32":
+            listed = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            return str(pid) in listed.stdout
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # It exists; we are simply not allowed to signal it.
+            return True
+        return True
+
+    def test_killing_a_dead_process_is_harmless(self, docker_server: Any) -> None:
+        process = self._child("pass")
+        process.wait(timeout=30)
+
+        docker_server._kill_tree(process)
 
 
 class TestTimeouts:
