@@ -137,14 +137,18 @@ async def test_project_root_aws_server_is_registered_from_backend_cwd(
     monkeypatch.setenv("PATH", venv_bin + os.pathsep + os.environ.get("PATH", ""))
 
     settings = Settings()
-    assert settings.mcp.servers == {"aws": "python ../mcp_servers/aws/server.py"}
+    assert settings.mcp.servers == {
+        "aws": "python ../mcp_servers/aws/server.py",
+        "docker": "python ../mcp_servers/docker/server.py",
+    }
 
     async with MCPClientManager(settings.mcp) as connected:
-        assert connected.connected_servers == ["aws"]
+        assert connected.connected_servers == ["aws", "docker"]
         tools = await connected.discover_tools()
 
     assert tools
-    assert all(tool.qualified_name.startswith("aws.") for tool in tools)
+    assert any(tool.qualified_name.startswith("aws.") for tool in tools)
+    assert all(tool.qualified_name.split(".")[0] in {"aws", "docker"} for tool in tools)
 
 
 @pytest.fixture

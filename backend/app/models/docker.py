@@ -18,12 +18,20 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.models.repository import RepositoryProfile
 
+#: The stages a deployment step can report. ``target`` and ``prepare`` exist for
+#: a remote target: reaching and readiness-checking the machine happens before
+#: any Docker work, and a failure there must not be filed under ``build``.
+#: ``verify`` is the workflow's own verdict, distinct from the health check the
+#: container reports about itself.
 DeploymentStage = Literal[
+    "target",
+    "prepare",
     "inspect",
     "build",
     "run",
     "health",
     "logs",
+    "verify",
 ]
 
 StepOutcome = Literal["ok", "skipped", "failed", "refused", "unhealthy"]
@@ -57,6 +65,15 @@ class DockerDeployRequest(BaseModel):
         default_factory=list,
         max_length=8,
         description="Port mappings as 'host:container', e.g. ['8080:8000'].",
+    )
+    health_path: str = Field(
+        default="/health",
+        max_length=255,
+        description=(
+            "Path the verifier probes on the published port. It is the "
+            "application's own endpoint, unrelated to the image's HEALTHCHECK, "
+            "and defaults to the conventional /health."
+        ),
     )
 
     approve: bool = Field(
@@ -131,6 +148,16 @@ class DockerDeployRequest(BaseModel):
                 raise ValueError(f"{spec!r} is not a valid port mapping; use 'host:container'.")
             if not all(1 <= int(part) <= 65535 for part in parts):
                 raise ValueError(f"{spec!r} contains a port outside the range 1-65535.")
+        return value
+
+    @field_validator("health_path")
+    @classmethod
+    def _check_health_path(cls, value: str) -> str:
+        """The verifier passes this straight into a probe URL, so shape it early."""
+        if not value.startswith("/"):
+            raise ValueError("A health path must start with '/'.")
+        if ".." in value or any(char.isspace() for char in value):
+            raise ValueError("A health path may not contain '..' or whitespace.")
         return value
 
 

@@ -224,15 +224,38 @@ Three behaviours are deliberate and worth preserving:
 `dry_run: true` inspects and reports the plan without building or running
 anything.
 
+## EC2 deployment
+
+`app/agents/ec2_deployment.py` runs the same PLAN → EXECUTE → VERIFY workflow
+against the instance configured in `AEGIS_EC2__*`, in three transports:
+
+| Module | Transport | Responsibility |
+| ------ | --------- | -------------- |
+| `app/services/ssh.py` | SSH | reachability, Docker readiness, loopback health probe |
+| scoped MCP server `docker-ec2` | `DOCKER_HOST=ssh://user@host` | every Docker call: build, run, inspect |
+| `app/services/mcp_manager.py` | stdio | opens the scope per run, registers its tools under the policy, closes it |
+
+The target is configuration, never a request field. SSH preparation commands do
+not pass through the MCP policy, so they check the request's `approve` flag
+before launching anything — installing or starting Docker on the instance is
+refused (and reported as a refused step) without it. The local `docker` server
+is never repointed: the scope is a second server with its own qualified tool
+names, closed when the run ends.
+
+`POST /api/deployment/ec2` is the entry point; `docs/ec2-deployment.md` covers
+prerequisites, configuration and troubleshooting.
+
 ## Execution and verification
 
-Three modules, three separate concerns:
+Five modules, five separate concerns:
 
 | Module | Responsibility |
 | ------ | -------------- |
+| `app/agents/deployment_workflow.py` | PLAN → EXECUTE → VERIFY → DEBUG → RECOVER, and history |
 | `app/agents/execution_engine.py` | Run tasks in order, and record what happened |
 | `app/agents/deployment_verification.py` | Decide whether the deployment is actually healthy |
 | `app/agents/debug_agent.py` | Explain a failure and propose fixes, applying nothing |
+| `app/agents/ec2_deployment.py` | Deploy to a configured EC2 instance: SSH readiness, then the same workflow through a scoped Docker server |
 
 ### The executor
 

@@ -23,6 +23,7 @@ from enum import StrEnum
 from pydantic import BaseModel, Field, model_validator
 
 from app.models.deployment_plan import RepositoryDeploymentPlan
+from app.models.deployment_target import DeploymentTarget
 from app.models.execution import ExecutionAction
 from app.models.incident import IncidentReport
 from app.models.verification import VerificationResult
@@ -133,6 +134,9 @@ class DeploymentRecord(BaseModel):
     commit_ref: str | None = None
     image: str | None = None
     container: str | None = None
+    #: Where it ran. None for the local daemon, which predates this field and
+    #: stays absent rather than being relabelled after the fact.
+    target: DeploymentTarget | None = None
 
     status: DeploymentStatus = DeploymentStatus.IN_PROGRESS
     #: Failed verification, then recovered. Kept separate from ``status`` because
@@ -195,6 +199,7 @@ class DeploymentSummary(BaseModel):
     commit_ref: str | None = None
     image: str | None = None
     container: str | None = None
+    target: DeploymentTarget | None = None
     status: DeploymentStatus
     recovered: bool = False
     escalated: bool = False
@@ -216,6 +221,7 @@ class DeploymentSummary(BaseModel):
             commit_ref=record.commit_ref,
             image=record.image,
             container=record.container,
+            target=record.target,
             status=record.status,
             recovered=record.recovered,
             escalated=record.escalated,
@@ -277,6 +283,7 @@ __all__ = [
     "DeploymentRecord",
     "DeploymentStatus",
     "DeploymentSummary",
+    "DeploymentTarget",
     "FailureRecord",
     "FailureStage",
     "Lesson",

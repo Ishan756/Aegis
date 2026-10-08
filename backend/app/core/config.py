@@ -265,6 +265,68 @@ class AWSSettings(_Section):
         return bool(self.region) and bool(self.profile or self.access_key_id is not None)
 
 
+class EC2Settings(_Section):
+    """EC2 deployment target.
+
+    The target is configuration, not a secret: the instance ID, region, host and
+    SSH user are recorded in history and safe to print. The private key is never
+    held here — only the path to it, and the path is never copied into a log, a
+    record or a response body. Key *contents* stay on disk where the operator put
+    them.
+
+    Nothing in this section is contacted at startup. The values describe where a
+    deployment would go; :mod:`app.agents.ec2_deployment` is what goes there, and
+    only after the execution policy has approved the mutating steps.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Master switch. False means POST /api/deployment/ec2 refuses.",
+    )
+    instance_id: str | None = Field(
+        default=None, description="EC2 instance ID, e.g. 'i-0a58da05a18f6c802'."
+    )
+    region: str | None = Field(
+        default=None,
+        description="AWS region the instance lives in. Falls back to AEGIS_AWS__REGION.",
+    )
+    host: str | None = Field(
+        default=None,
+        description=(
+            "Address the target is reached at, for SSH, the Docker-over-SSH daemon "
+            "and health probes: the public IP or a DNS name."
+        ),
+    )
+    ssh_user: str = Field(default="ec2-user", min_length=1, max_length=64)
+    ssh_key_file: Path | None = Field(
+        default=None,
+        description="Path to the private key on the Aegis host. Never sent anywhere.",
+    )
+    ssh_timeout_seconds: float = Field(default=30.0, gt=0, le=300.0)
+    host_port: int = Field(default=8080, ge=1, le=65535)
+    container_port: int = Field(default=8000, ge=1, le=65535)
+    image: str = Field(default="aegis-sample:ec2", min_length=1, max_length=255)
+    container_name: str = Field(default="aegis-sample-ec2", min_length=1, max_length=128)
+    health_path: str = Field(default="/healthz", min_length=1, max_length=255)
+    install_docker: bool = Field(
+        default=True,
+        description=(
+            "Permit installing Docker on the target when it is missing. Still "
+            "requires approve=true on the request; this only decides whether "
+            "approval can authorise it at all."
+        ),
+    )
+
+    @property
+    def is_configured(self) -> bool:
+        """Whether an EC2 deployment could be attempted at all.
+
+        Reports configuration presence, not reachability: nothing here opens a
+        connection or touches the key file.
+        """
+        return bool(self.enabled and self.instance_id and self.host and self.ssh_key_file)
+
+
 class Settings(BaseSettings):
     """Runtime configuration for the Aegis backend."""
 
@@ -333,6 +395,7 @@ class Settings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     aws: AWSSettings = Field(default_factory=AWSSettings)
+    ec2: EC2Settings = Field(default_factory=EC2Settings)
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -363,6 +426,7 @@ class Settings(BaseSettings):
             "database": self.database.is_configured,
             "redis": self.redis.is_configured,
             "aws": self.aws.is_configured,
+            "ec2_target": self.ec2.is_configured,
         }
 
     def safe_summary(self) -> dict[str, object]:

@@ -23,6 +23,7 @@ from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.models.deployment_target import DeploymentTarget
 from app.models.github import DeploymentReadiness, GitHubRepositoryAnalysisRequest, ReadinessCheck
 from app.models.repository import PackageManager
 
@@ -360,6 +361,16 @@ class DeploymentPlanRequest(GitHubRepositoryAnalysisRequest):
         description="Also read open issues. The plan does not need them; useful for triage.",
     )
 
+    deployment_target: DeploymentTarget | None = Field(
+        default=None,
+        description=(
+            "Where the plan would deploy: omit for the local daemon. A remote "
+            "target changes the plan's wording, commands and approval reasons "
+            "to name that target; it does not change what the repository "
+            "analysis finds."
+        ),
+    )
+
     @field_validator("issue_limit", mode="before")
     @classmethod
     def _bound_issue_limit(cls, value: Any) -> Any:
@@ -389,6 +400,9 @@ class DeploymentPlanState(TypedDict, total=False):
     requested_ref: str | None
     include_issues: bool
     issue_limit: int
+    #: Where the plan deploys. None is the local daemon, which is what every
+    #: plan was before targets existed.
+    deployment_target: DeploymentTarget | None
 
     profile: object
     readiness: DeploymentReadiness

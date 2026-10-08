@@ -24,11 +24,17 @@ were drawn where they were.
                     │  │ mcp/      MCP client  │ │
                     │  └──────────┬───────────┘ │
                     └─────────────┼─────────────┘
-                                  │ stdio (planned)
+                                  │ stdio (MCP)
                     ┌─────────────▼─────────────┐
                     │  mcp_servers/             │
                     │  github · docker · k8s    │
                     │  aws                      │
+                    └─────────────┬─────────────┘
+                                  │ DOCKER_HOST=ssh://user@host
+                                  │ (scoped server, per run)
+                    ┌─────────────▼─────────────┐
+                    │  EC2 instance             │
+                    │  Docker daemon + app      │
                     └───────────────────────────┘
 ```
 
@@ -53,6 +59,14 @@ configured rather than pretending. Postgres and Redis are declared so the
 dependency edges are visible, but nothing requires them, so the project boots
 with no infrastructure at all.
 
+**Remote targets change where a call goes, never what is allowed.** A
+deployment to EC2 opens a *scoped* Docker MCP server whose environment sets
+`DOCKER_HOST=ssh://user@host`; tools registered under that server's name are
+evaluated by the same policy as the local ones. The local server is never
+repointed, request bodies never carry a target (it is configuration), and SSH
+commands — which do not pass through the MCP policy — take the request's
+`approve` flag as their gate. See `docs/ec2-deployment.md`.
+
 ## Backend layering
 
 Dependencies point in one direction only:
@@ -70,26 +84,42 @@ the layers above it, so configuration and logging cannot create cycles.
 
 ## State and checkpoints
 
-Long-running agent runs will be checkpointed so an interrupted deployment can be
-resumed and audited. Redis is the intended store for hot state (status, locks);
-Postgres for durable history (deployments, approvals, tool call records). The
-boundary is declared in `app/cache/` and `app/db/` but not yet wired.
+Deployment history is written through the `MemoryStore` protocol with an
+in-memory implementation (default) and a PostgreSQL one selected by
+configuration, so the API never learns which it is talking to; persistence is
+best-effort and a failed write is logged, not raised. Every run is recorded as
+in-progress before its first stage, so an interrupted deployment reads as
+interrupted rather than absent. Redis is still the intended store for hot state
+(status, locks); that boundary is declared but not wired.
 
-## Safety model (planned)
+## Safety model
 
 The agent is autonomous but not unsupervised. Three escalating levels:
 
-1. **Read-only** — analysis and planning. No approval needed.
-2. **Mutating** — creating a branch, opening a PR, applying a manifest.
-   Requires explicit human approval, recorded with the approver identity.
-3. **Destructive** — deleting, rolling back, terminating. Requires approval and
-   a verified rollback path.
+1. **Read-only** — analysis, planning, status probes. No approval needed.
+2. **Mutating** — build, start, branch creation. Requires explicit human
+   approval, recorded with the request's approval reference.
+3. **Destructive** — stop, rollback. Requires approval and is separately marked
+   in the policy.
 
 Levels are assigned per tool, declared in the MCP server, and enforced centrally
-in `app/mcp` so an individual agent cannot escalate its own permissions.
+by `app/services/mcp_policy.py`: the policy is deny-by-default, refuses
+dangerous argument shapes outright, and distinguishes "may run" from "may run
+once a human has approved". An individual agent cannot escalate its own
+permissions, because it never decides — it submits a `ToolCallRequest` and the
+policy answers.
+
+Commands that bypass MCP (the SSH preparation for a remote target) take the
+request's `approve` flag as their gate, checked in the same code that would
+launch them. Self-healing is off by default and cannot edit code or
+configuration under any setting.
 
 ## Current status
 
-Only the foundation is implemented: configuration, logging, the HTTP health
-surface and the dashboard. Every other package is an empty, documented boundary.
-See `docs/roadmap.md` for what gets built next.
+Configuration, logging, the HTTP surface, repository analysis, deployment
+planning, the sequential execution engine, the PLAN → EXECUTE → VERIFY workflow,
+seven-check verification, evidence-backed failure investigation, bounded
+self-healing (off by default), persistent deployment history, and the GitHub,
+Docker and AWS MCP servers are implemented. Stage 16 adds deployments to a
+configured EC2 instance over SSH and a scoped Docker server.
+`docs/roadmap.md` tracks what remains.

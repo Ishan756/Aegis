@@ -37,6 +37,7 @@ from app.models.deployment_record import (
     DeploymentQuery,
     DeploymentRecord,
     DeploymentStatus,
+    DeploymentTarget,
     FailureRecord,
     FailureStage,
     Lesson,
@@ -87,18 +88,25 @@ class DeploymentMemoryService:
         *,
         request: Any = None,
         deployment_id: str | None = None,
+        target: DeploymentTarget | None = None,
     ) -> DeploymentRecord:
         """Record a deployment as in-progress and return it.
 
         Called before the first stage so an interrupted run still appears in
         history. Without it, a deployment that hangs or is killed leaves no trace,
         and "it vanished" is indistinguishable from "it never ran".
+
+        ``target`` is a separate argument rather than a field on the request: the
+        destination is chosen by the operator's configuration, so taking it from
+        a request body would let a caller record — and aim — a deployment at a
+        host nobody approved.
         """
         record = DeploymentRecord(
             deployment_id=deployment_id or uuid.uuid4().hex,
             repository_path=getattr(request, "repository_path", None),
             image=getattr(request, "image", None),
             container=getattr(request, "container_name", None),
+            target=target,
             status=DeploymentStatus.IN_PROGRESS,
             dry_run=bool(getattr(request, "dry_run", False)),
             request=_dump(request),
@@ -122,6 +130,7 @@ class DeploymentMemoryService:
         stopped: bool = False,
         stop_reason: str | None = None,
         started_at: datetime | None = None,
+        target: DeploymentTarget | None = None,
     ) -> DeploymentRecord:
         """Fold a finished run into its record.
 
@@ -140,6 +149,7 @@ class DeploymentMemoryService:
             stopped=stopped,
             stop_reason=stop_reason,
             started_at=started_at,
+            target=target,
         )
         record = await self._save(record)
         await self._remember(record)
@@ -160,6 +170,7 @@ class DeploymentMemoryService:
         stopped: bool,
         stop_reason: str | None,
         started_at: datetime | None,
+        target: DeploymentTarget | None = None,
     ) -> DeploymentRecord:
         finished_at = now()
         started = started_at or finished_at
@@ -190,6 +201,7 @@ class DeploymentMemoryService:
             commit_ref=commit_ref,
             image=getattr(request, "image", None),
             container=getattr(request, "container_name", None),
+            target=target,
             status=status,
             recovered=recovered,
             escalated=bool(getattr(recovery, "escalated", False)),

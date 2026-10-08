@@ -242,6 +242,24 @@ class VerificationRequest(BaseModel):
         description="Backing service names to check where a check is possible.",
     )
     include_logs: bool = Field(default=True, description="Scan application logs for fatal errors.")
+    docker_server: str = Field(
+        default="docker",
+        max_length=64,
+        description=(
+            "MCP server whose Docker daemon to inspect. The default is the local "
+            "one; a remote target is verified through the scoped server opened "
+            "for that target's session."
+        ),
+    )
+    probe_host: str | None = Field(
+        default=None,
+        max_length=253,
+        description=(
+            "Host to probe for the health endpoint, when it is not the loopback "
+            "the local daemon publishes on. Requires an allowlisted host; None "
+            "keeps the probe on loopback."
+        ),
+    )
 
 
 class VerificationState(TypedDict, total=False):
@@ -254,6 +272,8 @@ class VerificationState(TypedDict, total=False):
     log_tail: int
     dependencies: list[str]
     include_logs: bool
+    docker_server: str
+    probe_host: str | None
 
     checks: list[VerificationCheck]
     evidence: list[Evidence]
