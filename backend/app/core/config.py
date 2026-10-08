@@ -37,6 +37,8 @@ _LOG_LEVELS: dict[str, int] = {
     "CRITICAL": logging.CRITICAL,
 }
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
 
 class _Section(BaseModel):
     """Base for configuration sections."""
@@ -268,7 +270,10 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="AEGIS_",
-        env_file=".env",
+        # Load the repository configuration even when uvicorn is started from
+        # ``backend/``. A working-directory .env remains the later source so
+        # existing deployments can override the repository defaults.
+        env_file=(_PROJECT_ROOT / ".env", Path.cwd() / ".env"),
         env_file_encoding="utf-8",
         env_nested_delimiter="__",
         extra="ignore",
