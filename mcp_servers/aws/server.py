@@ -73,7 +73,28 @@ def _check_nonempty(value: str, name: str) -> str:
 def _child_env() -> dict[str, str]:
     """Allowlist environment passed to aws CLI subprocess."""
     allowed: dict[str, str] = {}
-    for k in ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "SHELL"):
+    for k in (
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "PATHEXT",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "SHELL",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ):
         if k in os.environ:
             allowed[k] = os.environ[k]
 

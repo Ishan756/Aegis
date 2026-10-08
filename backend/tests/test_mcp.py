@@ -17,6 +17,7 @@ so nothing depends on the working directory or on a globally installed package.
 
 from __future__ import annotations
 
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -25,13 +26,15 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from app.core.config import MCPSettings, get_settings
+from app.core.config import MCPSettings, Settings, get_settings
 from app.core.exceptions import ValidationError
 from app.models.mcp import ToolCallRequest, ToolDefinition
 from app.services.mcp_manager import MCPClientManager, get_manager, set_manager
 from app.services.mcp_policy import ToolExecutionPolicy, build_policy, classify_risk
 
 pytestmark = pytest.mark.anyio
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 # -- Fixture servers -----------------------------------------------------
@@ -123,6 +126,25 @@ def _write_server(directory: Path, name: str, source: str) -> str:
     path = directory / f"{name}.py"
     path.write_text(source, encoding="utf-8")
     return f"{shlex.quote(sys.executable)} {shlex.quote(str(path))}"
+
+
+async def test_project_root_aws_server_is_registered_from_backend_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The configured relative AWS command connects and exposes its tools."""
+    monkeypatch.chdir(REPO_ROOT / "backend")
+    venv_bin = str(Path(sys.executable).parent)
+    monkeypatch.setenv("PATH", venv_bin + os.pathsep + os.environ.get("PATH", ""))
+
+    settings = Settings()
+    assert settings.mcp.servers == {"aws": "python ../mcp_servers/aws/server.py"}
+
+    async with MCPClientManager(settings.mcp) as connected:
+        assert connected.connected_servers == ["aws"]
+        tools = await connected.discover_tools()
+
+    assert tools
+    assert all(tool.qualified_name.startswith("aws.") for tool in tools)
 
 
 @pytest.fixture
@@ -744,8 +766,18 @@ def test_call_endpoint_requires_a_requesting_agent(mcp_client: TestClient) -> No
 # -- Health reporting ----------------------------------------------------
 
 
-def test_health_reports_mcp_disabled_by_default(client: TestClient) -> None:
-    body = client.get("/api/v1/health").json()
+def test_health_reports_mcp_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AEGIS_MCP__ENABLED", "false")
+    monkeypatch.setenv("AEGIS_MCP__SERVERS", "")
+    get_settings.cache_clear()
+    from app.main import create_app
+
+    with TestClient(create_app()) as isolated_client:
+        body = isolated_client.get("/api/v1/health").json()
+    get_settings.cache_clear()
+
     mcp = next(c for c in body["components"] if c["name"] == "mcp")
     assert mcp["status"] == "not_configured"
     assert mcp["detail"] == "Disabled"

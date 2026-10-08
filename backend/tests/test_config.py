@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from app.core.config import Settings
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -49,6 +51,18 @@ def test_comma_separated_origins_load_from_env_file(tmp_path: Path) -> None:
 
     assert settings.environment == "dev"
     assert settings.cors_origins == ["http://a.test", "http://b.test"]
+
+
+def test_project_root_env_loads_when_started_from_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The repository .env is found when the process cwd is ``backend/``."""
+    backend = REPO_ROOT / "backend"
+    monkeypatch.chdir(backend)
+
+    settings = Settings()
+
+    assert settings.mcp.enabled is True
+    assert settings.mcp.servers == {"aws": "python ../mcp_servers/aws/server.py"}
+    assert "AEGIS_AWS__REGION" in settings.mcp.forward_environment
 
 
 def test_shipped_env_example_is_valid() -> None:
