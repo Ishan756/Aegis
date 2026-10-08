@@ -119,6 +119,7 @@ aegis/
 | `POST`  | `/api/deployment/workflow` | PLAN → EXECUTE → VERIFY, then DEBUG and bounded RECOVER on failure |
 | `POST`  | `/api/deployment/incident` | Investigate a failure read-only and report an evidence-backed cause |
 | `POST`  | `/api/deployment/recover`  | Attempt bounded, policy-gated automatic recovery |
+| `POST`  | `/api/deployment/ec2` | Deploy to the configured EC2 instance over SSH and Docker-over-SSH |
 | `GET`   | `/health`             | Unversioned alias for containers |
 | `GET`   | `/docs`               | OpenAPI / Swagger UI             |
 
@@ -761,6 +762,56 @@ If the build is blocked because there is no Dockerfile, the test step that needs
 the image and the run step that needs the image are blocked too — each with its
 own reason. Marking only the first step would invite someone to skip ahead.
 
+### EC2
+
+`POST /api/deployment/ec2` deploys to the instance configured in `AEGIS_EC2__*`.
+The target is **not part of the request**: a caller chooses what to build and
+whether to approve, never where it goes, so no request body can aim a deployment
+at a host nobody configured.
+
+```bash
+curl -s 'localhost:8000/api/deployment/ec2' \
+  -H 'content-type: application/json' \
+  -d '{"repository_path":"examples/sample_app","approve":true}' | less
+```
+
+The run is the same PLAN → EXECUTE → VERIFY workflow as a local deployment.
+What changes is the transport:
+
+| Concern | How it reaches the instance |
+| ------- | --------------------------- |
+| Readiness | `app/services/ssh.py`: `uname`, `docker version` — argument lists, never a shell |
+| Build, run, health | a **scoped** Docker MCP server (`docker-ec2`) started with `DOCKER_HOST=ssh://user@host` |
+| Extra evidence | a loopback health probe from inside the instance plus a CloudWatch CPU datapoint |
+| History | every record carries the target (`instance_id`, host, region), so the same commit on two machines stays distinguishable |
+
+Four properties worth stating plainly:
+
+**The local Docker server is never repointed.** `docker-ec2` is a second server
+registered for the duration of the run; calls are qualified
+(`docker-ec2.build_image`) and the execution policy approves or refuses them
+exactly as it does locally. A remote deployment cannot leave the local daemon
+aimed somewhere else.
+
+**SSH preparation is gated on `approve` too.** SSH commands do not pass through
+the MCP policy, so the request's `approve` flag is their gate: installing or
+starting Docker on the instance, or adding the SSH user to the `docker` group,
+is *refused* — and reported as a refused step — without it.
+`AEGIS_EC2__INSTALL_DOCKER=false` removes the install option entirely.
+
+**Verification probes twice.** Once through the instance's public address, which
+is what a client would dial, and once from inside the instance on loopback. When
+the inside probe answers 200 and the outside one fails, the response names the
+security-group port instead of reporting a vague health failure.
+
+**Configuration errors never become failed deployments.** A missing key file or
+an unconfigured target raises before the history row exists: a typo on this side
+must not be recorded as the instance's fault.
+
+The manual prerequisites (key file, security group, Docker on the instance),
+the full configuration reference and troubleshooting are in
+[`docs/ec2-deployment.md`](docs/ec2-deployment.md).
+
 ### Adding a server
 
 See [`mcp_servers/README.md`](mcp_servers/README.md) for the contract each server
@@ -909,7 +960,9 @@ out to a provider, a cloud API, or GitHub.
 
 - [`docs/architecture.md`](docs/architecture.md) — component design, layering
   rules, safety model
-- [`docs/roadmap.md`](docs/roadmap.md) — all 18 stages and current status
+- [`docs/roadmap.md`](docs/roadmap.md) — all 19 stages and current status
+- [`docs/ec2-deployment.md`](docs/ec2-deployment.md) — deploying to EC2:
+  prerequisites, configuration, verification and troubleshooting
 - [`mcp_servers/README.md`](mcp_servers/README.md) — MCP server contract and the
   rules every future server must follow
 - [`backend/README.md`](backend/README.md) — backend module reference

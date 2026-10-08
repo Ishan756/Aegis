@@ -27,6 +27,7 @@ than in an unrequested change.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -41,13 +42,19 @@ from app.agents.deployment_verification import verify_deployment
 from app.agents.execution_engine import execute_stage
 from app.agents.recovery_workflow import run_recovery
 from app.memory import get_memory_service
+from app.models.deployment_record import DeploymentRecord, DeploymentTarget
 from app.models.docker import DockerDeployRequest
 from app.models.execution import Task
 from app.models.incident import IncidentReport
 from app.models.self_healing import RecoveryOutcome, SelfHealingPolicy
-from app.models.verification import VerificationRequest, VerificationResult
+from app.models.verification import Evidence, VerificationRequest, VerificationResult
 
 logger = logging.getLogger(__name__)
+
+#: Who the workflow attributes Docker tool calls to when the request does not
+#: name a server: the local daemon, which is what this workflow ran against
+#: before remote targets existed.
+DEFAULT_DOCKER_SERVER = "docker"
 
 
 class DeploymentWorkflowState(TypedDict, total=False):
@@ -68,6 +75,15 @@ class DeploymentWorkflowState(TypedDict, total=False):
     approval_reference: str | None
     stop_on_critical_failure: bool
     dry_run: bool
+
+    # Remote-target plumbing. All three default for the local daemon, so a run
+    # that never mentions them behaves exactly as it did before targets existed.
+    docker_server: str
+    probe_host: str | None
+    target: DeploymentTarget | None
+    #: Optional read-only diagnostics appended to VERIFY's evidence. Used by the
+    #: EC2 flow for loopback and CloudWatch observations; must not mutate.
+    evidence_hook: Callable[[], Awaitable[list[Evidence]]] | None
 
     execution: Any
     response: Any
@@ -91,22 +107,28 @@ class DeploymentWorkflowState(TypedDict, total=False):
     incident: IncidentReport | None
 
 
-def build_plan(request: DockerDeployRequest) -> list[Task]:
+def build_plan(
+    request: DockerDeployRequest, *, docker_server: str = DEFAULT_DOCKER_SERVER
+) -> list[Task]:
     """PLAN: turn a deployment request into an ordered task list.
 
     Ordering encodes causality, not preference. Nothing that needs an image comes
     before the build, and nothing that needs a container comes before the run.
+
+    ``docker_server`` qualifies every tool name: a remote target's tasks name the
+    scoped server opened for that target, so the execution engine cannot reach a
+    remote daemon through the local server or vice versa.
     """
     image = request.image
     container = request.container_name
     ports = list(request.ports)
-    build_tool = "docker.build_image"
+    build_tool = f"{docker_server}.build_image"
     return [
         Task(
             id="1",
             title="Check the Docker daemon is available",
             description="Confirm a working daemon before building anything.",
-            tool="docker.docker_available",
+            tool=f"{docker_server}.docker_available",
             arguments={},
         ),
         Task(
@@ -130,7 +152,7 @@ def build_plan(request: DockerDeployRequest) -> list[Task]:
             id="3",
             title="Start the container",
             description="Run the built image on the local daemon.",
-            tool="docker.start_container",
+            tool=f"{docker_server}.start_container",
             arguments={
                 "image": image,
                 "name": container,
@@ -159,18 +181,22 @@ def expected_port(request: DockerDeployRequest) -> int | None:
 async def plan_stage(state: DeploymentWorkflowState) -> dict[str, Any]:
     """The PLAN node."""
     request: DockerDeployRequest = state["request"]
-    tasks = build_plan(request)
+    docker_server = state.get("docker_server") or DEFAULT_DOCKER_SERVER
+    tasks = build_plan(request, docker_server=docker_server)
     return {
         "tasks": tasks,
         "verification_request": VerificationRequest(
             container_name=request.container_name,
             expected_port=expected_port(request),
-            health_path="/health",
+            health_path=request.health_path,
             log_tail=request.log_tail,
+            docker_server=docker_server,
+            probe_host=state.get("probe_host"),
         ),
         "plan_explanation": (
             f"{len(tasks)} tasks: verify the daemon, build {request.image!r}, "
-            f"start {request.container_name!r}. Every mutating task needs approval."
+            f"start {request.container_name!r} on {docker_server}. "
+            f"Every mutating task needs approval."
         ),
     }
 
@@ -181,9 +207,29 @@ async def verify_stage(state: DeploymentWorkflowState) -> dict[str, Any]:
     Takes the ``VerificationRequest`` built during PLAN rather than rebuilding one
     from loose state keys, so the port and health path the plan promised are the
     ones actually checked.
+
+    An ``evidence_hook`` runs here, inside VERIFY and before history is written,
+    so target-specific observations (a probe from inside the instance, a
+    CloudWatch datapoint) land in the same record as the checks they supplement.
+    A hook that raises degrades to one warning of evidence rather than failing a
+    verification that already succeeded.
     """
     request: VerificationRequest = state["verification_request"]
     result = await verify_deployment(request)
+
+    hook: Callable[[], Awaitable[list[Evidence]]] | None = state.get("evidence_hook")
+    if hook is not None:
+        try:
+            result.evidence.extend(await hook())
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not fail the verdict
+            logger.warning("verification evidence hook failed", extra={"error": str(exc)})
+            result.evidence.append(
+                Evidence(
+                    source="verification.evidence_hook",
+                    detail=f"additional diagnostics were unavailable: {type(exc).__name__}",
+                )
+            )
+
     return {
         "verification": result,
         "result": result,
@@ -234,6 +280,7 @@ async def recover_stage(state: DeploymentWorkflowState) -> dict[str, Any]:
     request: DockerDeployRequest = state["request"]
     verification: VerificationResult | None = state.get("result")
     policy: SelfHealingPolicy = state.get("self_healing_policy") or SelfHealingPolicy()
+    docker_server = state.get("docker_server") or DEFAULT_DOCKER_SERVER
 
     outcome = await run_recovery(
         policy,
@@ -244,8 +291,12 @@ async def recover_stage(state: DeploymentWorkflowState) -> dict[str, Any]:
         image=request.image,
         repository_path=request.repository_path,
         human_approved=bool(state.get("self_healing_human_approved")),
-        verify=_build_verifier(request),
-        redeploy=_build_redeployer(request),
+        verify=_build_verifier(
+            request,
+            docker_server=docker_server,
+            probe_host=state.get("probe_host"),
+        ),
+        redeploy=_build_redeployer(request, docker_server=docker_server),
     )
 
     logger.info(
@@ -261,8 +312,13 @@ async def recover_stage(state: DeploymentWorkflowState) -> dict[str, Any]:
     return {"recovery": outcome, "recovered": outcome.recovered, "incident": outcome.incident}
 
 
-def _build_verifier(request: DockerDeployRequest) -> Any:
-    """A verifier bound to this request's container and port."""
+def _build_verifier(
+    request: DockerDeployRequest,
+    *,
+    docker_server: str = DEFAULT_DOCKER_SERVER,
+    probe_host: str | None = None,
+) -> Any:
+    """A verifier bound to this request's container, port and server."""
     from app.agents.deployment_verification import verify_deployment
 
     async def verify() -> VerificationResult:
@@ -270,15 +326,19 @@ def _build_verifier(request: DockerDeployRequest) -> Any:
             VerificationRequest(
                 container_name=request.container_name,
                 expected_port=expected_port(request),
-                health_path="/health",
+                health_path=request.health_path,
                 log_tail=request.log_tail,
+                docker_server=docker_server,
+                probe_host=probe_host,
             )
         )
 
     return verify
 
 
-def _build_redeployer(request: DockerDeployRequest) -> Any:
+def _build_redeployer(
+    request: DockerDeployRequest, *, docker_server: str = DEFAULT_DOCKER_SERVER
+) -> Any:
     """Redeploy this request's container, without rebuilding the image.
 
     Restart is the fix; rebuilding is a separate, riskier action that has to be
@@ -295,7 +355,7 @@ def _build_redeployer(request: DockerDeployRequest) -> Any:
                     Task(
                         id="redeploy",
                         title=f"Restart {request.container_name}",
-                        tool="docker.start_container",
+                        tool=f"{docker_server}.start_container",
                         arguments={
                             "image": request.image,
                             "name": request.container_name,
@@ -347,19 +407,38 @@ async def run_deployment_workflow(
     *,
     self_healing_policy: SelfHealingPolicy | None = None,
     self_healing_human_approved: bool = False,
+    docker_server: str = DEFAULT_DOCKER_SERVER,
+    probe_host: str | None = None,
+    target: DeploymentTarget | None = None,
+    evidence_hook: Callable[[], Awaitable[list[Evidence]]] | None = None,
+    record: DeploymentRecord | None = None,
 ) -> dict[str, Any]:
-    """Run PLAN → EXECUTE → VERIFY → END for a local deployment.
+    """Run PLAN → EXECUTE → VERIFY → END for one deployment.
 
     ``request.approve`` is threaded into the EXECUTE stage unchanged. The workflow
     never manufactures approval: a request without ``approve: true`` has its build
     and run refused, exactly as a direct deployment would.
+
+    The three target parameters exist for remote deployments and default to the
+    local daemon: ``docker_server`` qualifies every tool name the plan and the
+    verifier use, ``probe_host`` says where the health endpoint is reachable
+    from, and ``target`` is recorded in history so two runs of the same commit on
+    different machines stay distinguishable. None of them can widen approval --
+    the server only names *where* a call goes, and the policy still decides
+    *whether* it may go.
+
+    ``record`` lets a caller that already opened the history row continue it
+    instead of opening a second: the EC2 flow begins one before its first SSH
+    connection so a hang still leaves a trace, and two rows for one deployment
+    would make history count runs that never happened.
     """
     memory = get_memory_service()
 
     # Recorded before the graph runs, so an interrupted or killed deployment still
     # appears in history. Without this, "it vanished" and "it never ran" look the
     # same from the history endpoint.
-    record = await memory.begin_deployment(request=request)
+    if record is None:
+        record = await memory.begin_deployment(request=request, target=target)
     started_at = record.started_at
 
     state: DeploymentWorkflowState = {
@@ -370,6 +449,10 @@ async def run_deployment_workflow(
         "dry_run": request.dry_run,
         "self_healing_policy": self_healing_policy or SelfHealingPolicy(),
         "self_healing_human_approved": self_healing_human_approved,
+        "docker_server": docker_server,
+        "probe_host": probe_host,
+        "target": target,
+        "evidence_hook": evidence_hook,
     }
 
     try:
@@ -393,6 +476,7 @@ async def run_deployment_workflow(
         stopped=bool(result.get("stopped")),
         stop_reason=result.get("stop_reason"),
         started_at=started_at,
+        target=target,
     )
 
     return {

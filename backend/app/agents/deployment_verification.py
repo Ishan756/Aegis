@@ -54,11 +54,23 @@ _BENIGN_RE = tuple(re.compile(pattern, re.IGNORECASE) for pattern in BENIGN_LOG_
 EXCERPT_LIMIT = 300
 
 
-async def _docker_tool(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Call a read-only Docker tool through the policy-enforcing MCP layer."""
+async def _docker_tool(
+    tool: str, arguments: dict[str, Any], request: VerificationRequest | None = None
+) -> dict[str, Any]:
+    """Call a read-only Docker tool through the policy-enforcing MCP layer.
+
+    The server comes from the request, so verifying a remote target runs against
+    the scoped server opened for that target instead of the local daemon.
+    ``http_probe`` additionally gains the request's ``probe_host`` here rather
+    than at each call site: one injection point means no probe can quietly
+    forget it and report loopback health as if it were the target's.
+    """
+    server = request.docker_server if request is not None else DOCKER_SERVER
+    if tool == "http_probe" and request is not None and request.probe_host:
+        arguments = {**arguments, "host": request.probe_host}
     result = await get_manager().call_tool(
         ToolCallRequest(
-            tool_name=f"{DOCKER_SERVER}.{tool}",
+            tool_name=f"{server}.{tool}",
             arguments=arguments,
             requested_by=REQUESTED_BY,
             reason="verifying a completed deployment",
@@ -69,6 +81,17 @@ async def _docker_tool(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
             result.error_message or f"Docker tool {tool!r} failed during verification."
         )
     return result.content if isinstance(result.content, dict) else {}
+
+
+def _source(request: VerificationRequest | None, tool: str) -> str:
+    """Evidence source naming the server that actually answered.
+
+    Defaults to the local server so an evidence line read after the fact says
+    which daemon the observation came from, rather than claiming ``docker.``
+    for a probe that ran against a remote target.
+    """
+    server = request.docker_server if request is not None else DOCKER_SERVER
+    return f"{server}.{tool}"
 
 
 def _check(
@@ -118,13 +141,16 @@ async def check_container_exists(
     MCP traffic and, worse, could observe three different moments in time.
     """
     try:
-        status = await _docker_tool("container_status", {"name": container})
+        status = await _docker_tool("container_status", {"name": container}, request)
     except UpstreamError as error:
         return None, _check(
             "container_exists",
             "fail",
             f"No container named {container!r}: {error}",
-            Evidence(source="docker.container_status", detail=str(error)[:EXCERPT_LIMIT]),
+            Evidence(
+                source=_source(request, "container_status"),
+                detail=str(error)[:EXCERPT_LIMIT],
+            ),
         )
 
     return status, _check(
@@ -132,14 +158,16 @@ async def check_container_exists(
         "pass",
         f"Container {container!r} exists.",
         Evidence(
-            source="docker.container_status",
+            source=_source(request, "container_status"),
             value=str(status.get("status")),
             detail=f"image={status.get('image')} created={status.get('created')}",
         ),
     )
 
 
-def check_container_running(status: dict[str, Any]) -> VerificationCheck:
+def check_container_running(
+    status: dict[str, Any], request: VerificationRequest | None = None
+) -> VerificationCheck:
     """The container must be running, and must not have been OOM-killed."""
     running = bool(status.get("running"))
     exit_code = status.get("exit_code")
@@ -150,7 +178,7 @@ def check_container_running(status: dict[str, Any]) -> VerificationCheck:
             "container_running",
             "fail",
             "The container was OOM-killed.",
-            Evidence(source="docker.container_status", detail="OOMKilled=true"),
+            Evidence(source=_source(request, "container_status"), detail="OOMKilled=true"),
         )
     if not running:
         return _check(
@@ -159,7 +187,7 @@ def check_container_running(status: dict[str, Any]) -> VerificationCheck:
             f"The container is not running "
             f"(state={status.get('status')!r}, exit_code={exit_code}).",
             Evidence(
-                source="docker.container_status",
+                source=_source(request, "container_status"),
                 value=str(status.get("status")),
                 detail=f"exit_code={exit_code} restart_count={status.get('restart_count')}",
             ),
@@ -169,7 +197,7 @@ def check_container_running(status: dict[str, Any]) -> VerificationCheck:
         "pass",
         "The container is running.",
         Evidence(
-            source="docker.container_status",
+            source=_source(request, "container_status"),
             value=str(status.get("status")),
             detail=f"started_at={status.get('started_at')}",
         ),
@@ -197,7 +225,7 @@ async def check_port_available(
                 "port_available",
                 "warn",
                 f"No expected port was supplied; Docker reports {observed}.",
-                Evidence(source="docker.container_status", detail=f"ports={observed}"),
+                Evidence(source=_source(request, "container_status"), detail=f"ports={observed}"),
             )
         return _not_applicable(
             "port_available",
@@ -211,13 +239,13 @@ async def check_port_available(
             "fail",
             f"Port {expected} is not published. Docker reports {sorted(host_ports) or 'no ports'}.",
             Evidence(
-                source="docker.container_status",
+                source=_source(request, "container_status"),
                 value=str(expected),
                 detail=f"published={sorted(port for port in host_ports if port)}",
             ),
         )
 
-    probe = await _docker_tool("http_probe", {"port": expected, "path": "/"})
+    probe = await _docker_tool("http_probe", {"port": expected, "path": "/"}, request)
 
     if not probe.get("reachable"):
         return _check(
@@ -226,7 +254,7 @@ async def check_port_available(
             f"Port {expected} is published but nothing answered: "
             f"{probe.get('error') or 'no response'}.",
             Evidence(
-                source="docker.http_probe",
+                source=_source(request, "http_probe"),
                 detail=str(probe.get("error"))[:EXCERPT_LIMIT],
                 value=f"port={expected}",
             ),
@@ -238,7 +266,7 @@ async def check_port_available(
         f"Port {expected} is published and answered HTTP {probe.get('status')} "
         f"in {probe.get('latency_ms')}ms.",
         Evidence(
-            source="docker.http_probe",
+            source=_source(request, "http_probe"),
             value=str(probe.get("status")),
             detail=f"port={expected} latency_ms={probe.get('latency_ms')}",
         ),
@@ -258,7 +286,7 @@ async def check_health_endpoint(
         reason = "No published port to probe."
         return None, _skipped("health_endpoint", reason), _skipped("health_status_code", reason)
 
-    probe = await _docker_tool("http_probe", {"port": port, "path": request.health_path})
+    probe = await _docker_tool("http_probe", {"port": port, "path": request.health_path}, request)
 
     if not probe.get("reachable"):
         return (
@@ -269,7 +297,7 @@ async def check_health_endpoint(
                 f"{request.health_path} on port {port} did not respond: "
                 f"{probe.get('error') or 'no response'}.",
                 Evidence(
-                    source="docker.http_probe",
+                    source=_source(request, "http_probe"),
                     detail=str(probe.get("error"))[:EXCERPT_LIMIT],
                 ),
             ),
@@ -281,7 +309,7 @@ async def check_health_endpoint(
         "pass",
         f"{request.health_path} responded in {probe.get('latency_ms')}ms.",
         Evidence(
-            source="docker.http_probe",
+            source=_source(request, "http_probe"),
             value=str(probe.get("status")),
             detail=f"content_type={probe.get('content_type')} url={probe.get('url')}",
         ),
@@ -301,7 +329,7 @@ def _check_health_status(probe: dict[str, Any], request: VerificationRequest) ->
             "pass",
             f"{request.health_path} returned {observed} as expected.",
             Evidence(
-                source="docker.http_probe",
+                source=_source(request, "http_probe"),
                 value=str(observed),
                 detail=body if body else None,
             ),
@@ -314,18 +342,22 @@ def _check_health_status(probe: dict[str, Any], request: VerificationRequest) ->
             "health_status_code",
             "warn",
             f"{request.health_path} returned {observed}, not the expected {expected}.",
-            Evidence(source="docker.http_probe", value=str(observed), detail=body or None),
+            Evidence(
+                source=_source(request, "http_probe"), value=str(observed), detail=body or None
+            ),
         )
 
     return _check(
         "health_status_code",
         "fail",
         f"{request.health_path} returned {observed}, expected {expected}.",
-        Evidence(source="docker.http_probe", value=str(observed), detail=body or None),
+        Evidence(source=_source(request, "http_probe"), value=str(observed), detail=body or None),
     )
 
 
-async def check_image_health(container: str) -> VerificationCheck:
+async def check_image_health(
+    container: str, request: VerificationRequest | None = None
+) -> VerificationCheck:
     """Report the image's own HEALTHCHECK verdict alongside the HTTP probe.
 
     Not one of the seven required checks, but folded into the evidence: an image
@@ -333,13 +365,16 @@ async def check_image_health(container: str) -> VerificationCheck:
     that disagreement would make the report look cleaner than reality.
     """
     try:
-        health = await _docker_tool("container_health", {"name": container})
+        health = await _docker_tool("container_health", {"name": container}, request)
     except UpstreamError as error:
         return _check(
             "health_status_code",
             "warn",
             f"The image's own HEALTHCHECK could not be read: {error}",
-            Evidence(source="docker.container_health", detail=str(error)[:EXCERPT_LIMIT]),
+            Evidence(
+                source=_source(request, "container_health"),
+                detail=str(error)[:EXCERPT_LIMIT],
+            ),
         )
 
     state = health.get("state")
@@ -348,20 +383,20 @@ async def check_image_health(container: str) -> VerificationCheck:
             "health_status_code",
             "warn",
             "The image declares no HEALTHCHECK, so only the HTTP probe could judge this.",
-            Evidence(source="docker.container_health", value=str(state)),
+            Evidence(source=_source(request, "container_health"), value=str(state)),
         )
     if state == "unhealthy":
         return _check(
             "health_status_code",
             "fail",
             f"The image's HEALTHCHECK reports unhealthy: {health.get('detail', '')}",
-            Evidence(source="docker.container_health", value=str(state)),
+            Evidence(source=_source(request, "container_health"), value=str(state)),
         )
     return _check(
         "health_status_code",
         "pass",
         f"The image's HEALTHCHECK reports {state}.",
-        Evidence(source="docker.container_health", value=str(state)),
+        Evidence(source=_source(request, "container_health"), value=str(state)),
     )
 
 
@@ -377,13 +412,15 @@ async def check_logs(container: str, request: VerificationRequest) -> Verificati
         return _not_applicable("logs_clean", "Log scanning was not requested.")
 
     try:
-        logs = await _docker_tool("container_logs", {"name": container, "tail": request.log_tail})
+        logs = await _docker_tool(
+            "container_logs", {"name": container, "tail": request.log_tail}, request
+        )
     except UpstreamError as error:
         return _check(
             "logs_clean",
             "warn",
             f"Logs could not be read: {error}",
-            Evidence(source="docker.container_logs", detail=str(error)[:EXCERPT_LIMIT]),
+            Evidence(source=_source(request, "container_logs"), detail=str(error)[:EXCERPT_LIMIT]),
         )
 
     lines = logs.get("logs") or []
@@ -392,7 +429,7 @@ async def check_logs(container: str, request: VerificationRequest) -> Verificati
             "logs_clean",
             "warn",
             "The container produced no log output, so it could not be judged.",
-            Evidence(source="docker.container_logs", detail="0 lines"),
+            Evidence(source=_source(request, "container_logs"), detail="0 lines"),
         )
 
     offenders: list[tuple[int, str]] = []
@@ -408,7 +445,7 @@ async def check_logs(container: str, request: VerificationRequest) -> Verificati
             "pass",
             f"No fatal errors in {len(lines)} log line(s).",
             Evidence(
-                source="docker.container_logs",
+                source=_source(request, "container_logs"),
                 detail=f"{len(lines)} lines scanned"
                 + (", truncated" if logs.get("truncated") else ""),
             ),
@@ -421,7 +458,7 @@ async def check_logs(container: str, request: VerificationRequest) -> Verificati
         "fail",
         f"{len(offenders)} log line(s) look fatal.",
         Evidence(
-            source="docker.container_logs",
+            source=_source(request, "container_logs"),
             detail=excerpt,
             value=str(len(offenders)),
         ),
@@ -451,7 +488,9 @@ async def check_dependencies(request: VerificationRequest) -> VerificationCheck:
                 unverifiable.append(dependency)
                 continue
             try:
-                probe = await _docker_tool("http_probe", {"port": int(host_port), "path": "/"})
+                probe = await _docker_tool(
+                    "http_probe", {"port": int(host_port), "path": "/"}, request
+                )
             except UpstreamError:
                 unverifiable.append(dependency)
                 continue
@@ -463,7 +502,7 @@ async def check_dependencies(request: VerificationRequest) -> VerificationCheck:
                     "fail",
                     f"Dependency {dependency!r} is not reachable: {probe.get('error')}.",
                     Evidence(
-                        source="docker.http_probe",
+                        source=_source(request, "http_probe"),
                         detail=str(probe.get("error"))[:EXCERPT_LIMIT],
                         value=dependency,
                     ),
@@ -475,7 +514,7 @@ async def check_dependencies(request: VerificationRequest) -> VerificationCheck:
 
     evidence = [
         Evidence(
-            source="docker.http_probe",
+            source=_source(request, "http_probe"),
             detail=f"reachable: {', '.join(verified)}" if verified else "nothing probed",
         )
     ]
@@ -565,7 +604,7 @@ async def verify_deployment(request: VerificationRequest) -> VerificationResult:
         status, failures, warnings, recommendation = _verdict(checks)
         return _build_result(request, checks, status, failures, warnings, recommendation, started)
 
-    checks.append(check_container_running(status_record))
+    checks.append(check_container_running(status_record, request))
 
     port_check = await check_port_available(status_record, request)
     checks.append(port_check)
@@ -579,7 +618,7 @@ async def verify_deployment(request: VerificationRequest) -> VerificationResult:
     # Only add the image's own verdict when the HTTP checks actually ran, so a
     # second health opinion never masquerades as the status check.
     if probe is not None and probe.get("reachable"):
-        checks.append(await check_image_health(request.container_name))
+        checks.append(await check_image_health(request.container_name, request))
 
     checks.append(await check_logs(request.container_name, request))
     checks.append(await check_dependencies(request))
@@ -638,6 +677,8 @@ async def verify_stage(state: VerificationState) -> dict[str, Any]:
         log_tail=state.get("log_tail", 200),
         dependencies=list(state.get("dependencies", [])),
         include_logs=state.get("include_logs", True),
+        docker_server=state.get("docker_server", DOCKER_SERVER),
+        probe_host=state.get("probe_host"),
     )
     result = await verify_deployment(request)
     return {

@@ -445,6 +445,29 @@ def _infer_services(
 # ---------------------------------------------------------------------------
 
 
+def _daemon_phrase(state: DeploymentPlanState) -> str:
+    """Where this plan's Docker calls land.
+
+    The local daemon by default, so an unchanged plan reads exactly as it did
+    before targets existed. With a target the same steps run on that target's
+    daemon, and a plan that still said "local" would be lying about itself.
+    """
+    target = state.get("deployment_target")
+    if target is None:
+        return "the local daemon"
+    where = target.host or target.instance_id or target.kind
+    return f"the {target.kind} target's daemon ({where})"
+
+
+def _ssh_prefix(state: DeploymentPlanState) -> str:
+    """Prefix that turns a local ``docker`` command into one the target runs."""
+    target = state.get("deployment_target")
+    if target is None or not target.host:
+        return ""
+    user = f"{target.ssh_user}@" if target.ssh_user else ""
+    return f"ssh {user}{target.host} "
+
+
 def plan_build(state: DeploymentPlanState) -> dict[str, Any]:
     """Choose a build strategy.
 
@@ -473,11 +496,11 @@ def plan_build(state: DeploymentPlanState) -> dict[str, Any]:
                 summary="Build a container image from the repository's Dockerfile.",
                 rationale=context,
                 tools=["docker.build_image"],
-                commands=["docker build -t <image> ."],
+                commands=[f"{_ssh_prefix(state)}docker build -t <image> ."],
                 confidence=0.9 if assets.dockerfile_read else 0.7,
                 limitations=[
                     "Dockerfile RUN steps execute as repository code during the build.",
-                    "No registry is configured; the image stays on the local daemon.",
+                    f"No registry is configured; the image stays on {_daemon_phrase(state)}.",
                 ],
                 recommended_changes=(
                     []
@@ -605,7 +628,10 @@ def plan_deployment(state: DeploymentPlanState) -> dict[str, Any]:
     build = state["build_strategy"]
     unresolved = [v for v in state["environment_variables"] if v.required and not v.resolved]
 
-    limitations = ["Local Docker daemon only. No AWS deployment and no registry push."]
+    if state.get("deployment_target") is None:
+        limitations = ["Local Docker daemon only. No AWS deployment and no registry push."]
+    else:
+        limitations = [f"Runs on {_daemon_phrase(state)} only. No registry push."]
     if stack.has_docker_compose:
         limitations.append(
             "A compose file exists and defines additional services; the plan does not "
@@ -619,8 +645,12 @@ def plan_deployment(state: DeploymentPlanState) -> dict[str, Any]:
     if build.approach == "docker":
         ports = assets.exposed_ports or [_framework_port(stack)]
         port_text = ", ".join(f"{port}:{port}" for port in ports if port)
-        summary = "Run the built image as a local container."
-        commands = [f"docker run -d -p {port_text or '<port>:<port>'} <image>"] if port_text else []
+        summary = f"Run the built image on {_daemon_phrase(state)}."
+        commands = (
+            [f"{_ssh_prefix(state)}docker run -d -p {port_text or '<port>:<port>'} <image>"]
+            if port_text
+            else []
+        )
         confidence = 0.9 if assets.dockerfile_read else 0.7
     else:
         summary = "Container deployment is not possible yet: no Dockerfile exists."
@@ -733,9 +763,10 @@ def plan_rollback(state: DeploymentPlanState) -> dict[str, Any]:
             )
         }
 
-    steps = ["docker stop <container>", "docker run -d <previous-image-tag>"]
+    prefix = _ssh_prefix(state)
+    steps = [f"{prefix}docker stop <container>", f"{prefix}docker run -d <previous-image-tag>"]
     limitations = [
-        "The image is local; rollback is limited to images still on this daemon.",
+        f"The image lives on {_daemon_phrase(state)}; rollback is limited to images still there.",
         "Rollback does not revert data migrations or any schema change the new version made.",
     ]
     if has_persistence:
@@ -926,7 +957,10 @@ def assess_approvals(state: DeploymentPlanState) -> dict[str, Any]:
         approval_requirements.append(
             ApprovalRequirement(
                 action="Build the container image",
-                reason="Dockerfile RUN steps execute repository code on this machine.",
+                reason=(
+                    "Dockerfile RUN steps execute repository code on "
+                    f"{_daemon_phrase(state)}."
+                ),
                 risk_level="medium",
                 tool="docker.build_image",
             )
@@ -934,7 +968,7 @@ def assess_approvals(state: DeploymentPlanState) -> dict[str, Any]:
         approval_requirements.append(
             ApprovalRequirement(
                 action="Start the container",
-                reason="Changes the state of the local Docker daemon.",
+                reason=f"Changes the state of {_daemon_phrase(state)}.",
                 risk_level="medium",
                 tool="docker.start_container",
             )
@@ -949,15 +983,28 @@ def assess_approvals(state: DeploymentPlanState) -> dict[str, Any]:
         )
     )
 
-    approval_requirements.append(
-        ApprovalRequirement(
-            action="Deploy to a managed cloud target",
-            reason="Would create or change billable infrastructure. Not configured yet; "
-            "the plan stops at the local daemon.",
-            risk_level="critical",
-            tool=None,
+    target = state.get("deployment_target")
+    if target is None:
+        approval_requirements.append(
+            ApprovalRequirement(
+                action="Deploy to a managed cloud target",
+                reason="Would create or change billable infrastructure. Not configured yet; "
+                "the plan stops at the local daemon.",
+                risk_level="critical",
+                tool=None,
+            )
         )
-    )
+    else:
+        where = target.host or target.instance_id or target.kind
+        approval_requirements.append(
+            ApprovalRequirement(
+                action=f"Deploy to the {target.kind} target ({where})",
+                reason="Would create or change billable infrastructure on the "
+                "configured target; nothing runs there without approval.",
+                risk_level="critical",
+                tool=None,
+            )
+        )
 
     for risk in state.get("risks", []):
         if risk.blocking:
@@ -1086,9 +1133,10 @@ def order_steps(state: DeploymentPlanState) -> dict[str, Any]:
 
     build_order = add(
         "Build the container image",
-        "Build the image locally. Dockerfile RUN steps execute repository code.",
+        f"Build the image on {_daemon_phrase(state)}. "
+        "Dockerfile RUN steps execute repository code.",
         tool="docker.build_image",
-        command="docker build -t <image> .",
+        command=f"{_ssh_prefix(state)}docker build -t <image> .",
         approval=True,
         blocked=build_blocked,
         blocked_reason="No Dockerfile in the repository." if build_blocked else None,
@@ -1113,7 +1161,7 @@ def order_steps(state: DeploymentPlanState) -> dict[str, Any]:
 
     run_order = add(
         "Start the container",
-        "Run the built image on the local daemon.",
+        f"Run the built image on {_daemon_phrase(state)}.",
         tool="docker.start_container",
         command=(
             state["deployment_strategy"].commands[0]
@@ -1306,6 +1354,7 @@ async def plan_repository_deployment(
         "requested_ref": request.branch,
         "include_issues": request.include_issues,
         "issue_limit": request.issue_limit,
+        "deployment_target": request.deployment_target,
     }
     result = await deployment_plan_graph.ainvoke(state)
     return result["plan"]

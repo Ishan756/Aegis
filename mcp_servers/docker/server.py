@@ -10,9 +10,11 @@ Tool                          Risk      Approval   Effect
 ``container_status``          low       no         none
 ``container_health``          low       no         none
 ``container_logs``            low       no         none
+``http_probe``                low       no         read-only HTTP GET
 ``build_image``               medium    yes        writes an image
 ``start_container``           medium    yes        writes and starts a container
 ``stop_container``            high      yes        stops a running container
+``remove_container``          high      yes        deletes a stopped container
 ============================  ========  ==========  ===========================
 
 Safety properties, each enforced here rather than merely documented:
@@ -920,6 +922,48 @@ def stop_container(
 
 
 @server.tool(
+    name="remove_container",
+    title="Remove a stopped container",
+    description=(
+        "Delete a container that is no longer running, so its name and ports are "
+        "free again.\n\n"
+        "This is destructive: the container's logs and exit state go with it, and "
+        "there is no undo. A running container is refused outright — stop it first, "
+        "so a workload is never deleted by a single call."
+    ),
+    annotations=ToolAnnotations(
+        read_only_hint=False,
+        destructive_hint=True,
+        idempotent_hint=True,
+    ),
+)
+def remove_container(
+    name: Annotated[str, Field(description="Name of the stopped container to remove.")],
+) -> dict[str, Any]:
+    """Remove a stopped container. Destructive; requires approval."""
+    container_name = _check_container_name(name)
+
+    before = _run(["inspect", "--format", "{{.State.Status}}", container_name], timeout=15)
+    if not before.success:
+        raise ToolError(f"No container named {container_name!r}.")
+
+    status = before.stdout.strip()
+    if status == "running":
+        raise ToolError(
+            f"Container {container_name!r} is still running. Stop it first; a "
+            "running workload is never removed in one step."
+        )
+
+    result = _require_success(_run(["rm", container_name], timeout=30), f"remove {container_name}")
+
+    return {
+        "container": container_name,
+        "removed": result.success,
+        "previous_status": status,
+    }
+
+
+@server.tool(
     name="container_status",
     title="Get container status",
     description=(
@@ -1204,9 +1248,21 @@ def _tail(text: str, max_lines: int, max_bytes: int) -> tuple[str, bool]:
 #: anything the host can reach.
 PROBE_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]{0,255}$")
 
-#: Loopback only. The tool builds the URL itself and takes no host parameter, so
-#: there is nothing to redirect the request elsewhere -- no SSRF surface at all.
+#: Loopback only, unless more hosts are explicitly allowed. The tool builds the
+#: URL itself from a validated host, so the allowlist below is the only thing
+#: that can point a probe anywhere else.
 PROBE_HOST = "127.0.0.1"
+
+#: Hosts ``http_probe`` may be pointed at, from ``AEGIS_DOCKER__PROBE_HOSTS``.
+#: Empty by default: a fresh install can probe loopback and nothing else, which
+#: keeps the "no SSRF surface" property even when this server is later given a
+#: deployment target to verify. Each host is a deliberate operator decision.
+PROBE_HOSTS = frozenset(
+    item.strip() for item in os.environ.get("AEGIS_DOCKER__PROBE_HOSTS", "").split(",") if item.strip()
+)
+
+#: Hostnames and IPv4 addresses only: no scheme, no port, no path, no '@'.
+PROBE_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$")
 
 #: Upper bound on a probe's response body, so a chatty endpoint cannot exhaust
 #: memory or flood the transcript.
@@ -1226,27 +1282,62 @@ def _check_probe_path(path: str) -> str:
     return path
 
 
+def _check_probe_host(host: str | None) -> str:
+    """Resolve the host a probe may target, refusing anything not allowed.
+
+    Loopback is always permitted. Anything else must be named in
+    ``AEGIS_DOCKER__PROBE_HOSTS``, which the operator sets deliberately — a
+    server pointed at a deployment target needs to verify that target, but an
+    unconfigured server stays loopback-only no matter what a client asks for.
+    """
+    if host is None or host == PROBE_HOST:
+        return PROBE_HOST
+    if not PROBE_HOST_RE.match(host):
+        raise ToolError(
+            "A probe host must be a plain hostname or IPv4 address, without a "
+            "scheme, port or path."
+        )
+    if host not in PROBE_HOSTS:
+        raise ToolError(
+            f"Probing {host!r} is not allowed. The operator must add it to "
+            "AEGIS_DOCKER__PROBE_HOSTS for this server."
+        )
+    return host
+
+
 @server.tool(
     name="http_probe",
-    title="Probe a local HTTP endpoint",
+    title="Probe an HTTP endpoint",
     description=(
-        "Issue a read-only GET to a path on a port published on this machine, and "
-        "report the status code, latency and a short body excerpt.\n\n"
-        "The host is fixed to loopback and the method is fixed to GET: there is no "
-        "parameter for either, so the request cannot be aimed at another host or "
-        "given a body. Redirects are not followed."
+        "Issue a read-only GET to a path on a port and report the status code, "
+        "latency and a short body excerpt.\n\n"
+        "The host is loopback unless the operator has allowlisted another host in "
+        "``AEGIS_DOCKER__PROBE_HOSTS`` (a deployment target is verified by naming "
+        "it there), the method is fixed to GET, and redirects are not followed. "
+        "There is no parameter for a body or a header, so the request cannot be "
+        "shaped into anything but a probe."
     ),
     annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True),
 )
 def http_probe(
     port: Annotated[int, Field(description="Host port to probe.", ge=1, le=65535)],
     path: Annotated[str, Field(description="Request path, e.g. '/health'.")] = "/",
+    host: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Host to probe. Defaults to loopback; any other host must be "
+                "allowlisted in AEGIS_DOCKER__PROBE_HOSTS."
+            )
+        ),
+    ] = None,
     timeout_seconds: Annotated[float, Field(description="Timeout in seconds.", ge=0.5, le=30.0)] = 5.0,
 ) -> dict[str, Any]:
-    """Probe a loopback HTTP endpoint. Read-only."""
+    """Probe an HTTP endpoint. Read-only."""
     _check_port(str(port))
     request_path = _check_probe_path(path)
-    url = f"http://{PROBE_HOST}:{port}{request_path}"
+    target_host = _check_probe_host(host)
+    url = f"http://{target_host}:{port}{request_path}"
 
     # No redirect handler, so a 302 is reported as a 302 rather than chased.
     opener = urllib.request.build_opener(_NoRedirect)

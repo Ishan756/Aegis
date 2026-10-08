@@ -61,7 +61,10 @@ def test_project_root_env_loads_when_started_from_backend(monkeypatch: pytest.Mo
     settings = Settings()
 
     assert settings.mcp.enabled is True
-    assert settings.mcp.servers == {"aws": "python ../mcp_servers/aws/server.py"}
+    assert settings.mcp.servers == {
+        "aws": "python ../mcp_servers/aws/server.py",
+        "docker": "python ../mcp_servers/docker/server.py",
+    }
     assert "AEGIS_AWS__REGION" in settings.mcp.forward_environment
 
 

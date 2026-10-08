@@ -21,7 +21,8 @@ import asyncio
 import os
 import shlex
 import time
-from contextlib import AsyncExitStack
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
@@ -136,10 +137,7 @@ class MCPClientManager:
         argv is visible to any process on the host via ``ps``, the environment of
         another user's process is not.
         """
-        names = self._settings.forward_environment
-        if not names:
-            return None
-        forwarded = {name: os.environ[name] for name in names if name in os.environ}
+        forwarded = self.forwarded_environment
         if forwarded:
             logger.info(
                 "forwarding environment to MCP servers",
@@ -147,6 +145,95 @@ class MCPClientManager:
                 extra={"server": "*", "variables": sorted(forwarded)},
             )
         return forwarded or None
+
+    @property
+    def forwarded_environment(self) -> dict[str, str]:
+        """The variables named in ``AEGIS_MCP__FORWARD_ENVIRONMENT`` that are set.
+
+        Exposed so a caller opening a :meth:`scoped_server` can build on the same
+        forwarding rules rather than inventing a second set.
+        """
+        names = self._settings.forward_environment
+        return {name: os.environ[name] for name in names if name in os.environ}
+
+    @asynccontextmanager
+    async def scoped_server(
+        self,
+        name: str,
+        *,
+        command: str,
+        env: dict[str, str] | None = None,
+    ) -> AsyncIterator[ClientSession]:
+        """Connect one extra server for the duration of a ``async with`` block.
+
+        The long-lived servers are configured once at startup, so they share one
+        environment. A deployment target needs the *same* server code pointed
+        somewhere else — the Docker CLI with ``DOCKER_HOST`` set at a remote
+        daemon — and giving the shared server that variable would repoint every
+        local deployment at the remote host too. So the target-specific server is
+        a separate process with its own environment, torn down when the block
+        ends.
+
+        Its tools are registered with the policy under ``name`` for the duration,
+        so calls through :meth:`call_tool` are evaluated exactly like any other:
+        an invented tool name is still refused, and a mutating tool still needs
+        approval. Unregistering on exit is what stops a name from surviving its
+        server — a registered tool whose session is gone would fail later with
+        "server_unavailable" instead of "not discovered".
+
+        Not safe to use concurrently: two blocks would race on the shared
+        registry. Deployments are sequential by design, and a lock would only
+        disguise that assumption rather than enforce anything about ordering.
+        """
+        if self._closed:
+            raise ConfigurationError("The MCP client manager is closed.")
+        if not self._settings.enabled:
+            raise ConfigurationError(
+                "MCP is disabled (AEGIS_MCP__ENABLED=false); a scoped server cannot start."
+            )
+        if name in self._sessions:
+            raise ConfigurationError(f"MCP server {name!r} is already connected.")
+
+        argv = shlex.split(command)
+        if not argv:
+            raise ConfigurationError(f"The command for MCP server {name!r} is empty.")
+
+        stack = AsyncExitStack()
+        try:
+            params = StdioServerParameters(
+                command=argv[0],
+                args=argv[1:],
+                env=env or {},
+            )
+            read_stream, write_stream = await stack.enter_async_context(stdio_client(params))
+            session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
+            await asyncio.wait_for(session.initialize(), timeout=_CONNECT_TIMEOUT_SECONDS)
+            response = await asyncio.wait_for(
+                session.list_tools(),
+                timeout=self._settings.request_timeout_seconds,
+            )
+            definitions = [self._to_definition(name, tool) for tool in response.tools]
+
+            self._sessions[name] = session
+            self._tools = [*self._tools, *definitions]
+            self._policy.register(self._tools)
+            logger.info(
+                "scoped MCP server connected",
+                extra={"server": name, "command": argv[0], "tool_count": len(definitions)},
+            )
+            yield session
+        finally:
+            self._sessions.pop(name, None)
+            self._tools = [tool for tool in self._tools if tool.server != name]
+            self._policy.register(self._tools)
+            try:
+                await stack.aclose()
+            except Exception as exc:  # noqa: BLE001 - teardown must not mask the block's error
+                logger.warning(
+                    "scoped MCP server shutdown failed",
+                    extra={"server": name, "error": str(exc)},
+                )
+            logger.info("scoped MCP server disconnected", extra={"server": name})
 
     async def close(self) -> None:
         """Shut every server process down."""

@@ -592,6 +592,31 @@ async def test_no_local_aws_deployment_is_planned(fake_github: Any) -> None:
     ), "no step may suggest an AWS command"
 
 
+async def test_a_remote_target_rewrites_the_plan_honestly(fake_github: Any) -> None:
+    """A plan for a remote target must not claim it stops at the local daemon."""
+    from app.models.deployment_target import DeploymentTarget
+
+    target = DeploymentTarget(kind="ec2", host="203.0.113.10", ssh_user="ec2-user")
+    plan = await _plan(fake_github(**NODE_EXPRESS), deployment_target=target)
+
+    limitations = plan.deployment_strategy.limitations
+    assert any("203.0.113.10" in limit for limit in limitations)
+    assert not any("No AWS" in limit for limit in limitations), (
+        "an EC2 target is an AWS deployment; claiming otherwise would be false"
+    )
+
+    assert plan.deployment_strategy.commands
+    assert plan.deployment_strategy.commands[0].startswith("ssh ec2-user@203.0.113.10 ")
+
+    build_step = next(s for s in plan.ordered_steps if s.title == "Build the container image")
+    assert build_step.command is not None
+    assert build_step.command.startswith("ssh ec2-user@203.0.113.10 ")
+
+    cloud = next(a for a in plan.approval_requirements if a.risk_level == "critical")
+    assert "ec2 target" in cloud.action
+    assert "203.0.113.10" in cloud.action
+
+
 # ---------------------------------------------------------------------------
 # Risks, approvals, ordering
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # Aegis Roadmap
 
-Eighteen stages, built in order. Each stage should leave the project running and
+Nineteen stages, built in order. Each stage should leave the project running and
 tests green before the next begins.
 
 Legend: ✅ done · ◔ partial · ⬜ not started
@@ -152,10 +152,14 @@ request cannot escape.
 
 - [ ] `mcp_servers/kubernetes` — apply, rollout status, pod logs
 
-## Stage 13 — MCP: AWS ⬜
+## Stage 13 — MCP: AWS ◔
 
-- [ ] `mcp_servers/aws` — deploy, describe, logs, rollback
-- [ ] Credential handling and least-privilege roles
+- [x] `mcp_servers/aws` — EC2 describe/state/networking, CloudWatch logs and
+      metrics, S3 deployment reports
+- [x] Credential handling: credentials are read from the forwarded environment,
+      never from tool arguments or logs
+- [ ] Least-privilege IAM roles for the server's calls
+- [ ] Rollback / instance lifecycle actions
 
 ## Stage 14 — Failure investigation ✅
 
@@ -206,18 +210,41 @@ request cannot escape.
 - [ ] Lessons recalled automatically before a deployment runs
 - [ ] A migration runner, once the schema starts changing in the field
 
-## Stage 16 — Dashboard maturity ⬜
+## Stage 16 — EC2 deployment ✅
+
+- [x] Target is configuration (`AEGIS_EC2__*`), never part of a request: a caller
+      chooses what to build and whether to approve, not where it goes
+- [x] SSH transport (`app/services/ssh.py`): argument lists quoted once, per-run
+      temp `HOME` with an isolated config and `known_hosts`, never a local shell
+- [x] Scoped Docker MCP server (`docker-ec2`) launched with
+      `DOCKER_HOST=ssh://user@host`; the local server is never repointed
+- [x] Target readiness before any task runs: reachability, then Docker present,
+      running and usable — with installation, service start and docker-group
+      access all gated on the request's `approve` flag
+- [x] Same PLAN → EXECUTE → VERIFY workflow as local deployments; task tools are
+      qualified by the scoped server, so the MCP approval policy is unchanged
+- [x] Two-view health verification: probe through the target's address and a
+      loopback probe from inside the instance, so a closed security-group port
+      is distinguished from a broken application
+- [x] CloudWatch CPU datapoint appended as evidence to the same verification
+- [x] Target recorded on every deployment (`DeploymentTarget`), so the same
+      commit deployed to different machines stays distinguishable in history
+- [x] `POST /api/deployment/ec2`, JSON or Markdown
+- [ ] Bastion / ProxyJump host support
+- [ ] More than one configured target per deployment
+
+## Stage 17 — Dashboard maturity ⬜
 
 - [ ] Live agent run view (history is recorded, not streamed)
 - [ ] Approval UI
 - [ ] Historical trend charts over the stored records
 
-## Stage 17 — Evaluation ⬜
+## Stage 18 — Evaluation ⬜
 
 - [ ] Scenario suite with pass/fail criteria
 - [ ] Regression harness across agent prompt changes
 
-## Stage 18 — Hardening ⬜
+## Stage 19 — Hardening ⬜
 
 - [ ] AuthN/AuthZ on the API
 - [ ] Rate limiting and abuse guards
@@ -226,7 +253,7 @@ request cannot escape.
 
 ## Explicitly out of scope until the stages above
 
-AWS integration · registry push · write-capable GitHub tools · autonomous
-deployment. Self-healing exists but is bounded, off by default, and cannot edit
-code or configuration; the Kubernetes equivalents of these fix categories are not
-built.
+Registry push · write-capable GitHub tools · autonomous deployment. The AWS MCP
+covers description, metrics and reports only (Stage 13); self-healing exists but
+is bounded, off by default, and cannot edit code or configuration; the
+Kubernetes equivalents of these fix categories are not built.

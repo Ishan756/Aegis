@@ -55,7 +55,12 @@ DOCKER_TOOLS = {
 class FakeDocker:
     """A Docker MCP server that can be told exactly how to misbehave."""
 
-    def __init__(self) -> None:
+    def __init__(self, server: str = "docker") -> None:
+        #: The server name tools are registered and called under. The default is
+        #: the local daemon; the EC2 flow uses its scoped server's name, and a
+        #: policy registered under the wrong name would refuse every call — which
+        #: is exactly what a test for that wiring should notice.
+        self.server = server
         #: Every tool call that was *requested*, refused ones included.
         self.calls: list[tuple[str, dict[str, Any]]] = []
         #: Only the tools that actually ran. A refused call never reaches the
@@ -78,8 +83,8 @@ class FakeDocker:
         policy.register(
             [
                 ToolDefinition(
-                    qualified_name=f"docker.{name}",
-                    server="docker",
+                    qualified_name=f"{self.server}.{name}",
+                    server=self.server,
                     name=name,
                     description=name,
                     risk_level=level,
@@ -138,7 +143,7 @@ class FakeDocker:
             return ToolCallResult(
                 tool_name=name,
                 qualified_name=request.tool_name,
-                server="docker",
+                server=self.server,
                 success=False,
                 error_code=code,
                 error_message=message,
@@ -166,7 +171,7 @@ class FakeDocker:
         return ToolCallResult(
             tool_name=name,
             qualified_name=request.tool_name,
-            server="docker",
+            server=self.server,
             success=True,
             content=behaviour.get("content", {}),
             requires_approval=decision.requires_approval,
@@ -689,6 +694,41 @@ async def test_verification_records_evidence(docker: FakeDocker) -> None:
     sources = {item.source for item in result.evidence}
     assert "docker.container_status" in sources
     assert "docker.http_probe" in sources
+
+
+async def test_probe_host_and_scoped_server_flow_into_the_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A remote target is probed where it is reachable, through its own server.
+
+    The default probe is loopback and the default server is the local daemon;
+    both would silently verify the wrong machine for an EC2 deployment. The
+    policy is registered under ``docker-ec2`` only, so a call that still said
+    ``docker.*`` would be refused and the assertions below would never see a
+    probe at all.
+    """
+    fake = FakeDocker(server="docker-ec2")
+    _healthy(fake)
+    monkeypatch.setattr("app.services.mcp_manager.get_manager", lambda: fake)
+    monkeypatch.setattr("app.agents.deployment_verification.get_manager", lambda: fake)
+
+    result = await verify_deployment(
+        VerificationRequest(
+            container_name="c1",
+            expected_port=8080,
+            health_path="/health",
+            docker_server="docker-ec2",
+            probe_host="203.0.113.10",
+        )
+    )
+
+    probes = [args for name, args in fake.calls if name == "http_probe"]
+    assert probes, "the health endpoint must be probed"
+    assert all(args.get("host") == "203.0.113.10" for args in probes)
+    assert result.status == "SUCCESS"
+    sources = {item.source for item in result.evidence}
+    assert "docker-ec2.http_probe" in sources
+    assert "docker-ec2.container_status" in sources
 
 
 async def test_missing_container_fails_and_skips_the_rest(docker: FakeDocker) -> None:

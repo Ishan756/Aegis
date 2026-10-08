@@ -199,10 +199,15 @@ class TestNoShellAccess:
             "container_status": {"name"},
             "container_health": {"name"},
             "container_logs": {"name", "tail"},
-            # Deliberately no host: the verifier may only reach the loopback
-            # interface it just published a port on. No method either, because a
-            # probe that could POST would be a way to mutate what it verifies.
-            "http_probe": {"port", "path", "timeout_seconds"},
+            # The probe is GET-only — no method, header or body parameter, so a
+            # probe cannot mutate what it verifies. `host` exists because a
+            # remote target must be verifiable, but the server refuses any host
+            # the operator has not allowlisted in AEGIS_DOCKER__PROBE_HOSTS:
+            # unconfigured, it reaches loopback and nothing else.
+            "http_probe": {"port", "path", "timeout_seconds", "host"},
+            # Removing a stopped container is a delete, so it is destructive
+            # and approval-gated; it takes only the name, nothing else.
+            "remove_container": {"name"},
         }
 
         actual = {
@@ -261,16 +266,26 @@ class TestHttpProbe:
     the schema rather than blocked at runtime.
     """
 
-    def test_the_probe_exposes_no_way_to_choose_a_host(self, docker_server: Any) -> None:
-        """No host parameter: the probe may only reach the loopback interface.
+    def test_the_probe_host_is_allowlist_gated(self, docker_server: Any) -> None:
+        """A ``host`` parameter exists, and reaches nothing the operator did not allow.
 
-        Without this the verifier could be pointed at an arbitrary internal
-        service, turning a health check into a request forger.
+        Loopback is always permitted — that is the unconfigured default. Any
+        other host is refused unless named in ``AEGIS_DOCKER__PROBE_HOSTS``, so
+        the verifier can be pointed at a deployment target without the probe
+        becoming a way to fetch arbitrary internal services.
         """
         properties = set(
             (registered_tools(docker_server)["http_probe"].parameters or {}).get("properties", {})
         )
-        assert not properties & {"host", "hostname", "url", "address", "ip"}
+        assert "host" in properties
+
+        assert docker_server._check_probe_host(None) == "127.0.0.1"
+        assert docker_server._check_probe_host("127.0.0.1") == "127.0.0.1"
+
+        with pytest.raises(docker_server.ToolError, match="PROBE_HOSTS"):
+            docker_server._check_probe_host("10.0.0.5")
+        with pytest.raises(docker_server.ToolError, match="PROBE_HOSTS"):
+            docker_server._check_probe_host("metadata.google.internal")
 
     def test_the_probe_is_get_only(self, docker_server: Any) -> None:
         """No method, header or body parameter, so the probe cannot mutate."""
@@ -687,18 +702,18 @@ class TestToolClassification:
             assert annotations.read_only_hint is True, f"{name} must be read-only"
 
     def test_mutating_tools_are_not_marked_read_only(self, docker_server: Any) -> None:
-        for name in ("build_image", "start_container", "stop_container"):
+        for name in ("build_image", "start_container", "stop_container", "remove_container"):
             annotations = registered_tools(docker_server)[name].annotations
             assert annotations.read_only_hint is False, f"{name} changes state"
 
-    def test_only_stop_is_destructive(self, docker_server: Any) -> None:
-        """Stopping a running workload is the one destructive tool here."""
+    def test_stop_and_remove_are_destructive(self, docker_server: Any) -> None:
+        """Stopping and deleting are the destructive tools; both must be gated."""
         destructive = {
             name
             for name, tool in registered_tools(docker_server).items()
             if tool.annotations.destructive_hint
         }
-        assert destructive == {"stop_container"}
+        assert destructive == {"stop_container", "remove_container"}
 
     def test_destructive_tool_requires_approval(self) -> None:
         """The policy must actually gate it, not merely label it."""

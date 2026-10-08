@@ -15,6 +15,7 @@ from app.api.routes import (
     deployment,
     deployments,
     docker,
+    ec2,
     execution,
     github,
     mcp,
@@ -137,6 +138,7 @@ def create_app() -> FastAPI:
     app.include_router(mcp.router, prefix="/api")
     app.include_router(github.router, prefix="/api")
     app.include_router(deployment.router, prefix="/api")
+    app.include_router(ec2.router, prefix="/api")
     app.include_router(execution.router, prefix="/api")
     app.include_router(verification.router, prefix="/api")
     app.include_router(recovery.router, prefix="/api")
