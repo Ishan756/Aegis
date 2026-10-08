@@ -15,7 +15,7 @@ standalone process exposing a narrow set of audited tools; the backend's
 | `docker/`     | `docker_available`, `list_images`, `build_image`, `start_container`, `stop_container`, `container_status`, `container_health`, `container_logs`, `http_probe` | Shipped (writes locally) |
 | `docker/`     | build image, push image, inspect container, read logs       | Stage 10 |
 | `kubernetes/` | apply manifest, rollout status, pod logs                    | Stage 12 |
-| `aws/`        | describe instances, deploy, tail logs, rollback             | Stage 13 |
+| `aws/`        | ec2_describe_instance, ec2_instance_state, ec2_instance_networking, s3_upload_deployment_report, s3_get_deployment_report, cloudwatch_get_log_events, cloudwatch_get_metrics | Stage 13 |
 
 ### The demo server
 
